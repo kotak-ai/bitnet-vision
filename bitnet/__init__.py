@@ -3,7 +3,7 @@
 Exports core modules like `BitLinear` and `RMSNorm`.
 """
 
-from .modules import BitLinear, RMSNorm
+from .modules import BitLinear, HBitLinear, RMSNorm
 
-__all__ = ["BitLinear", "RMSNorm"]
+__all__ = ["BitLinear", "HBitLinear", "RMSNorm"]
 

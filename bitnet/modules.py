@@ -10,6 +10,7 @@ This file implements:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Final, Tuple
 
 import torch
@@ -112,6 +113,106 @@ def _quantize_activations_int(
     return x_quant_ste, eta
 
 
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _next_power_of_two(n: int) -> int:
+    """Smallest power of two >= n (for n>=1)."""
+
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def hadamard_matrix(m: int, *, device: torch.device | None = None, dtype: torch.dtype | None = None) -> Tensor:
+    """Generate a Walsh-Hadamard matrix H_m for power-of-2 m.
+
+    Properties:
+    - H_m @ H_m.T = m * I
+    - H_m^{-1} = H_m / m
+    - Recursive: H_2n = [[H_n, H_n], [H_n, -H_n]]
+    """
+
+    m = int(m)
+    if not _is_power_of_two(m):
+        raise ValueError(f"Hadamard matrix requires power-of-2 m (got {m})")
+
+    device = device if device is not None else torch.device("cpu")
+    dtype = dtype if dtype is not None else torch.float32
+
+    h = torch.ones((1, 1), device=device, dtype=dtype)
+    size = 1
+    while size < m:
+        # [[H, H], [H, -H]]
+        h = torch.cat(
+            (
+                torch.cat((h, h), dim=1),
+                torch.cat((h, -h), dim=1),
+            ),
+            dim=0,
+        )
+        size *= 2
+    return h
+
+
+def fwht(x: Tensor) -> Tensor:
+    """Fast Walsh-Hadamard Transform (FWHT) along last dimension.
+
+    Computes y = x @ H_m where H_m is the Walsh-Hadamard matrix (entries ±1),
+    with O(m log m) complexity. This is NOT normalized by default.
+
+    Args:
+      x: tensor of shape (..., m) where m is a power of two.
+
+    Returns:
+      Tensor of same shape as x.
+    """
+
+    m = int(x.shape[-1])
+    if not _is_power_of_two(m):
+        raise ValueError(f"FWHT requires power-of-2 last dim (got {m})")
+
+    y = x
+    h = 1
+    # Iterative butterfly structure.
+    while h < m:
+        # Group into blocks of size 2h
+        y = y.view(*y.shape[:-1], -1, 2 * h)
+        a = y[..., :, :h]
+        b = y[..., :, h : 2 * h]
+        y = torch.cat((a + b, a - b), dim=-1)
+        y = y.view(*y.shape[:-2], m)
+        h *= 2
+    return y
+
+
+def hadamard_transform(x: Tensor, *, pad_to_pow2: bool = True) -> Tensor:
+    """Apply an *orthonormal* Hadamard transform along last dim.
+
+    Forward (per your spec):
+      x_transformed = x @ H_m / sqrt(m)
+
+    For non-power-of-2 dims, we optionally pad with zeros to the next power of two,
+    apply the transform, then slice back to the original size.
+    """
+
+    n = int(x.shape[-1])
+    if _is_power_of_two(n):
+        m = n
+        y = fwht(x) / math.sqrt(m)
+        return y
+
+    if not pad_to_pow2:
+        raise ValueError(f"Hadamard transform requires power-of-2 dim (got {n})")
+
+    m = _next_power_of_two(n)
+    pad = m - n
+    x_pad = torch.nn.functional.pad(x, (0, pad))
+    y_pad = fwht(x_pad) / math.sqrt(m)
+    return y_pad[..., :n]
+
+
 class BitLinear(nn.Module):
     """BitNet-style linear layer: ternary weights + int8 per-token activations.
 
@@ -198,6 +299,73 @@ class BitLinear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, eps={self.eps}, activation_bits={self.act_cfg.bits}"
         )
+
+
+class HBitLinear(BitLinear):
+    """BitNet v2 H-BitLinear: online Hadamard transform before activation quantization.
+
+    Forward:
+      1) x_h = x @ H_m / sqrt(m)  (orthonormal Hadamard, implemented via FWHT)
+      2) quantize x_h per-token with absmax to int8 range
+      3) ternarize weights with absmean
+      4) y = (x_quant × W_ternary) × (γ × η / Q_b)
+
+    Backward:
+      The orthonormal Hadamard transform is orthogonal, so gradients are transformed
+      by the transpose (which equals itself). Since this implementation is purely
+      composed of differentiable tensor ops, autograd applies the correct transform.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = False,
+        eps: float = 1e-5,
+        activation_bits: int = 8,
+        pad_to_pow2: bool = True,
+    ) -> None:
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            eps=eps,
+            activation_bits=activation_bits,
+        )
+        self.pad_to_pow2 = bool(pad_to_pow2)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.dim() not in (2, 3):
+            raise ValueError(
+                f"HBitLinear expects 2D or 3D input (got shape {tuple(x.shape)})"
+            )
+        if x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"Expected last dim == in_features ({self.in_features}), got {x.shape[-1]}"
+            )
+
+        # 1) Online Hadamard transform (orthonormal)
+        x_h = hadamard_transform(x, pad_to_pow2=self.pad_to_pow2)
+
+        # 2) Quantize activations after Hadamard smoothing
+        x_quant_ste, eta = _quantize_activations_int(x_h, eps=self.eps, cfg=self.act_cfg)
+
+        # 3) Quantize weights (ternary)
+        w_ternary_ste, gamma = _ternarize_absmean(self.weight, eps=self.eps)
+
+        # 4) Same BitLinear compute
+        y_int = torch.matmul(x_quant_ste, w_ternary_ste.t())
+        scale = (gamma * eta) / float(self.act_cfg.q_b)
+        y = y_int * scale
+
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+    def extra_repr(self) -> str:
+        base = super().extra_repr()
+        return f"{base}, pad_to_pow2={self.pad_to_pow2}"
 
 
 class RMSNorm(nn.Module):
