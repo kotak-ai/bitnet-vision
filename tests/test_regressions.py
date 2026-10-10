@@ -436,3 +436,17 @@ def test_label_smoothing_changes_the_loss():
         return train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)["epochs"][0]["train_loss"]
 
     assert first_loss(0.0) != pytest.approx(first_loss(0.3))
+
+
+def test_config_differences_ignore_settings_that_cannot_matter():
+    from bitnet_vision.checkpoint import config_differences, upgrade_config
+    from bitnet_vision.models import BitViTConfig
+
+    old = BitViTConfig().to_dict()
+    del old["hadamard_random_signs"]  # written before the field existed
+    assert config_differences(BitViTConfig(**upgrade_config(old)), BitViTConfig()) == []
+    old_h = {**old, "hadamard": True}
+    assert config_differences(BitViTConfig(**upgrade_config(old_h)), BitViTConfig(hadamard=True)) == [
+        "hadamard_random_signs"]
+    assert config_differences(BitViTConfig(), BitViTConfig(act_bits=4, hadamard=True)) == ["hadamard"]
+    assert config_differences(BitViTConfig(), BitViTConfig(embed_dim=96, num_heads=2)) == ["embed_dim", "num_heads"]

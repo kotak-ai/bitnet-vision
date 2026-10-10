@@ -11,8 +11,8 @@ from .export import PACKED_METADATA, convert_for_inference
 from .layers import BitLinear, HBitLinear
 from .models.vit import BitViT, BitViTConfig
 
-__all__ = ["save_model", "load_model", "upgrade_config", "transfer_weights", "save_packed", "load_packed",
-           "PACKED_FORMAT"]
+__all__ = ["save_model", "load_model", "upgrade_config", "config_differences", "transfer_weights", "save_packed",
+           "load_packed", "PACKED_FORMAT"]
 
 PACKED_FORMAT = "bitnet_vision.packed.v1"
 
@@ -20,6 +20,18 @@ PACKED_FORMAT = "bitnet_vision.packed.v1"
 def upgrade_config(config: dict[str, Any]) -> dict[str, Any]:
     """Fill in fields added after a checkpoint was written, keeping the behavior it was trained with."""
     return {"hadamard_random_signs": False, **config}  # rotations had no random signs before the field existed
+
+
+def config_differences(saved: BitViTConfig, current: BitViTConfig) -> list[str]:
+    """Config fields that differ in a way that changes the model.
+
+    Activation bits are ignored (a run may switch them itself, as in BitNet v2's final 4-bit phase), and
+    Hadamard-only settings are ignored when neither config uses Hadamard layers.
+    """
+    ignore = {"act_bits", "hadamard_act_bits"}
+    if not saved.hadamard and not current.hadamard:
+        ignore.add("hadamard_random_signs")
+    return [f for f, v in current.to_dict().items() if f not in ignore and getattr(saved, f) != v]
 
 
 def save_model(model: BitViT, path: str, **extra: Any) -> None:

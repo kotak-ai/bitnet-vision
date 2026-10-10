@@ -23,6 +23,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from bitnet_vision.checkpoint import (  # noqa: E402
+    config_differences,
     load_model,
     load_packed,
     save_model,
@@ -111,9 +112,7 @@ def main(argv=None) -> dict:
     if a.resume and os.path.exists(last):
         resume = torch.load(last, map_location="cpu", weights_only=True)
         saved = BitViTConfig(**upgrade_config(resume["model_config"]))
-        # Activation bits may have been switched by the run itself (BitNet v2's final 4-bit phase).
-        differ = [f for f, v in model.config.to_dict().items()
-                  if f not in ("act_bits", "hadamard_act_bits") and getattr(saved, f) != v]
+        differ = config_differences(saved, model.config)
         if differ:
             raise SystemExit(f"--resume: the model flags differ from the checkpoint in {differ}; "
                              "use the original command line or a new --out directory")
