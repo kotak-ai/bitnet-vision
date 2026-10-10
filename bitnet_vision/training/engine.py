@@ -146,14 +146,13 @@ def train(
     quantized = bool(getattr(config, "quantize", True))
     fp_steps = int(round(cfg.fp_fraction * total_steps)) if quantized else 0
     ramp_steps = int(cfg.quant_ramp_epochs * steps_per_epoch) if quantized else 0
-    if fp_steps + ramp_steps > total_steps:
-        raise ValueError(f"the full-precision phase ({fp_steps} steps) plus the quantization ramp ({ramp_steps} "
-                         f"steps) is longer than training ({total_steps} steps); the model would never be fully "
-                         "ternary")
     if cfg.final_act_bits_scope not in ("all", "rotated"):
         raise ValueError("final_act_bits_scope must be 'all' or 'rotated'")
     low_bit_step = (int(round((1.0 - cfg.final_act_bits_fraction) * total_steps))
                     if cfg.final_act_bits is not None else None)
+    if low_bit_step is not None and low_bit_step >= total_steps:
+        raise ValueError(f"final_act_bits_fraction={cfg.final_act_bits_fraction} rounds to no low-bit steps out of "
+                         f"{total_steps}; use a larger fraction")
     if (low_bit_step is not None and cfg.final_act_bits_scope == "rotated"
             and not any(isinstance(m, HBitLinear) for m in model.modules())):
         raise ValueError("final_act_bits_scope='rotated' but the model has no HBitLinear layers (use hadamard=True)")
@@ -163,9 +162,18 @@ def train(
             return 0.0
         return min(1.0, (s - fp_steps + 1) / ramp_steps) if ramp_steps else 1.0
 
+    if quantized and quant_strength_at(total_steps - 1) < 1.0:
+        raise ValueError(f"the full-precision phase ({fp_steps} steps) plus the quantization ramp ({ramp_steps} "
+                         f"steps) leaves no fully ternary training step out of {total_steps}")
+
     history: dict[str, Any] = {"train_config": cfg.to_dict(), "epochs": []}
     start_epoch, step = 0, 0
     if resume is not None:
+        saved_cfg = resume.get("history", {}).get("train_config", {})
+        changed = [f for f in _RUN_SHAPING_FIELDS if f in saved_cfg and saved_cfg[f] != getattr(cfg, f)]
+        if changed:
+            raise ValueError(f"resume: training settings differ from the checkpoint in {changed}; resuming would "
+                             "bend the schedule. Use the original settings or start a new run.")
         model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
         start_epoch, step = resume["epoch"], resume["step"]
@@ -256,6 +264,13 @@ def train(
             _atomic_save(lambda f: f.write(json.dumps(history, indent=1).encode()),
                          os.path.join(out_dir, "metrics.json"))
     return history
+
+
+_RUN_SHAPING_FIELDS = (
+    "epochs", "batch_size", "lr", "schedule", "split", "stage2_factor", "restart_lr_ratio", "warmup_epochs",
+    "weight_decay", "stage2_weight_decay", "min_lr", "fp_fraction", "quant_ramp_epochs", "final_act_bits",
+    "final_act_bits_fraction", "final_act_bits_scope", "seed",
+)
 
 
 def _atomic_save(write: Callable[[Any], Any], path: str) -> None:

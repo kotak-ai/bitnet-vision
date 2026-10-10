@@ -101,7 +101,8 @@ python scripts/bench.py --checkpoint runs/ternary_kd/model.pt
 `scripts/cifar_experiments.sh` runs all three in sequence. Every run writes `metrics.json` (per-epoch
 accuracy and loss), `model.pt` and `summary.json`; ternary runs also record the share of weights at -1, 0
 and +1 and how many changed each epoch, and write the packed `packed.pt`. Interrupted runs continue with
-`--resume`.
+`--resume` and the original command line; the model is rebuilt from the checkpoint, and changed training
+settings are refused rather than silently bending the schedule.
 
 Schedules (`--schedule`): `bitnet` (Microsoft's recipe: learning rate times 2/3 and weight decay off at the
 midpoint), `bitnet_cosine`, `restart` (a short low learning-rate phase at the end, from FTerViT), `wsd`
@@ -160,7 +161,7 @@ not drop-in loadable there. All checkpoints load with `torch.load(..., weights_o
 
 `pytest` runs about 180 tests, including exact comparisons with Microsoft's reference code (forward and
 backward), float16/bfloat16 behavior, Hadamard exactness at every ViT width, export equivalence, resume
-exactness, and short end-to-end training runs. `python tools/mutation_test.py` plants 42 known bugs one at
+exactness, and short end-to-end training runs. `python tools/mutation_test.py` plants 43 known bugs one at
 a time (including every bug found in the old branches) and checks that the tests catch each one.
 
 ## Layout

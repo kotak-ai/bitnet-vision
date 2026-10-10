@@ -11,17 +11,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python: "3.11"
-            torch: "torch==2.4.1"
+          - python: "3.10"
+            torch: "torch==2.2.2"
+            numpy: "numpy<2"
           - python: "3.12"
             torch: "torch"
+            numpy: "numpy"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - name: Install CPU PyTorch
-        run: pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+        run: |
+          pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+          pip install "${{ matrix.numpy }}"
       - name: Install package
         run: pip install -e ".[dev]"
       - name: Lint

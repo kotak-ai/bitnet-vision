@@ -34,10 +34,12 @@ def test_train_eval_and_bench_scripts(tmp_path):
     _fake_cifar(data)
     train = _load_script("train")
     fp_out = str(tmp_path / "fp")
+    torch.manual_seed(123)  # scramble the global RNG: only the script's own --seed may make runs repeatable
     summary = train.main(["--data-dir", data, "--out", fp_out, "--fp", "--epochs", "1", "--batch-size", "50",
                           "--schedule", "cosine", "--warmup-epochs", "0", "--log-every", "0"])
     assert summary["quantized"] is False
     again = str(tmp_path / "fp_again")  # same --seed must give the same weights
+    torch.manual_seed(456)
     train.main(["--data-dir", data, "--out", again, "--fp", "--epochs", "1", "--batch-size", "50",
                 "--schedule", "cosine", "--warmup-epochs", "0", "--log-every", "0"])
     first = torch.load(os.path.join(fp_out, "model.pt"), weights_only=True)["model"]
@@ -59,6 +61,15 @@ def test_train_eval_and_bench_scripts(tmp_path):
     # switched to 4-bit activations (all layers, as in BitNet v2) for the last steps
     assert cfg["hadamard"] is True and cfg["hadamard_act_bits"] == 4 and cfg["act_bits"] == 4
 
+    # resuming a finished run reproduces it; resuming with different model flags is refused
+    again = train.main(["--data-dir", data, "--out", out, "--epochs", "1", "--batch-size", "50", "--log-every",
+                        "0", "--hadamard", "--schedule", "restart", "--warmup-epochs", "0", "--quant-ramp-epochs",
+                        "0.5", "--final-act-bits", "4", "--final-act-bits-fraction", "0.5", "--resume"])
+    assert again["final_test_acc"] == summary["final_test_acc"]
+    assert again["packed_test_acc"] == summary["packed_test_acc"]
+    with pytest.raises(SystemExit):
+        train.main(["--data-dir", data, "--out", out, "--epochs", "1", "--batch-size", "50", "--resume"])
+
     evaluate = _load_script("eval")
     info = evaluate.main([os.path.join(out, "packed.pt"), "--data-dir", data])
     assert info["kind"] == "packed" and info["acc"] == summary["packed_test_acc"]
@@ -72,3 +83,6 @@ def test_train_eval_and_bench_scripts(tmp_path):
     run = res["runs"][0]
     assert set(run["ms"]) == {"fp32", "ternary_training_mode", "packed_int8", "packed_float_matmul"}
     assert run["packed_vs_training_argmax_agreement"] >= 0.5
+    fp_bench = bench.main(["--checkpoint", os.path.join(fp_out, "model.pt"), "--batch-sizes", "2", "--threads", "1",
+                           "--repeats", "1"])  # a full-precision checkpoint is benchmarked as its ternary twin
+    assert fp_bench["model_config"]["quantize"] is True

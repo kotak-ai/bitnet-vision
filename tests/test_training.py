@@ -140,11 +140,6 @@ def test_train_loop_learns_and_keeps_ternary_codes_healthy(tmp_path):
     assert last["weight_decay"] == 0.0  # stage 2 switched weight decay off
     assert (tmp_path / "last.pt").exists() and (tmp_path / "metrics.json").exists()
 
-    resume = torch.load(tmp_path / "last.pt", weights_only=True)
-    cfg.epochs = 4
-    hist2 = train(model, _blobs(256, 0), _blobs(128, 1), cfg, log=lambda s: None, resume=resume)
-    assert [e["epoch"] for e in hist2["epochs"]] == [1, 2, 3, 4]
-
 
 @pytest.mark.slow
 def test_distilled_training_from_full_precision_init():

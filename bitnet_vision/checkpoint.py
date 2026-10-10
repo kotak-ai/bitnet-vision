@@ -11,12 +11,13 @@ from .export import PACKED_METADATA, convert_for_inference
 from .layers import BitLinear, HBitLinear
 from .models.vit import BitViT, BitViTConfig
 
-__all__ = ["save_model", "load_model", "transfer_weights", "save_packed", "load_packed", "PACKED_FORMAT"]
+__all__ = ["save_model", "load_model", "upgrade_config", "transfer_weights", "save_packed", "load_packed",
+           "PACKED_FORMAT"]
 
 PACKED_FORMAT = "bitnet_vision.packed.v1"
 
 
-def _upgrade_config(config: dict[str, Any]) -> dict[str, Any]:
+def upgrade_config(config: dict[str, Any]) -> dict[str, Any]:
     """Fill in fields added after a checkpoint was written, keeping the behavior it was trained with."""
     return {"hadamard_random_signs": False, **config}  # rotations had no random signs before the field existed
 
@@ -38,7 +39,7 @@ def load_model(path: str, map_location: str | torch.device = "cpu", **config_ove
     if "hadamard" in config_overrides and config_overrides["hadamard"] != ckpt["model_config"].get("hadamard"):
         raise ValueError("changing 'hadamard' on load would scramble the weights; build the new model and use "
                          "transfer_weights() instead")
-    cfg = BitViTConfig(**{**_upgrade_config(ckpt["model_config"]), **config_overrides})
+    cfg = BitViTConfig(**{**upgrade_config(ckpt["model_config"]), **config_overrides})
     model = BitViT(cfg)
     model.load_state_dict(ckpt["model"])
     return model
@@ -95,7 +96,7 @@ def load_packed(path: str, map_location: str | torch.device = "cpu", **inference
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
     if ckpt.get("format") != PACKED_FORMAT:
         raise ValueError(f"{path} is not a packed checkpoint ({PACKED_FORMAT})")
-    config = BitViTConfig(**{**_upgrade_config(ckpt["model_config"]), "quantize": True})
+    config = BitViTConfig(**{**upgrade_config(ckpt["model_config"]), "quantize": True})
     model = convert_for_inference(BitViT(config), inplace=True, **inference_kwargs)
     model.load_state_dict(ckpt["model"])
     return model.eval()

@@ -81,7 +81,7 @@ Small 3-layer ternary networks trained on the same synthetic task, average of 3 
 12. **Weak tests.** Planting plausible bugs in a copy of each branch, 8 of 13 survived 1bef's tests and 9 of
     14 survived 6825's (removing the rounding trick entirely still passed). 8216 had no tests. One 6825
     test was unseeded and failed about 41% of the time on its own. 1bef's tests failed under a plain
-    `pytest` command. For the rebuilt suite, `tools/mutation_test.py` plants 42 bugs one at a time,
+    `pytest` command. For the rebuilt suite, `tools/mutation_test.py` plants 43 bugs one at a time,
     including a version of each code bug in items 1 to 10 and 13, and checks that the tests catch each one.
 13. **1bef rejected 4D inputs** such as channels-last image tensors, and crashed on empty batches. Guarded
     by `test_bitlinear_matches_reference_outputs_and_gradients` (2D to 5D inputs) and

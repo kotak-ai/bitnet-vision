@@ -59,7 +59,8 @@ def main(argv=None) -> dict:
     a = p.parse_args(argv)
 
     torch.manual_seed(0)
-    tern = load_model(a.checkpoint).eval() if a.checkpoint else create_model(a.model).eval()
+    # A full-precision checkpoint is benchmarked as its ternary twin (latency does not depend on the values).
+    tern = load_model(a.checkpoint, quantize=True).eval() if a.checkpoint else create_model(a.model).eval()
     fp = create_model(a.model, **{**tern.config.to_dict(), "quantize": False}).eval()
     fp.load_state_dict(tern.state_dict())  # same weights, quantization off
     variants = {
@@ -80,7 +81,8 @@ def main(argv=None) -> dict:
                 print(f"torch.compile failed for {name}: {type(e).__name__}: {e}", file=sys.stderr)
 
     cfg = tern.config
-    results = {"model": a.model, "checkpoint": a.checkpoint, "environment": environment(), "runs": [],
+    results = {"model": None if a.checkpoint else a.model, "model_config": cfg.to_dict(), "checkpoint": a.checkpoint,
+               "environment": environment(), "runs": [],
                "bytes_fp32_state": packed_state_dict_bytes(fp.state_dict()),
                "bytes_packed_state": packed_state_dict_bytes(variants["packed_int8"].state_dict())}
     for threads in (int(t) for t in a.threads.split(",")):

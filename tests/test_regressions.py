@@ -25,7 +25,8 @@ def _colors(n, seed):
 
 
 def _small(**kw):
-    return create_model("bitvit_cifar_tiny", depth=1, embed_dim=96, num_heads=2, num_classes=4, **kw)
+    kw.setdefault("depth", 1)
+    return create_model("bitvit_cifar_tiny", embed_dim=96, num_heads=2, num_classes=4, **kw)
 
 
 # ---------------------------------------------------------------- export and checkpoints
@@ -159,12 +160,14 @@ def test_resume_reproduces_an_uninterrupted_run_with_drop_path(tmp_path):
     cfg = TrainConfig(epochs=3, batch_size=32, warmup_epochs=0.5, log_every=0)
     data = _colors(64, 0)
     torch.manual_seed(0)
-    init = _small(drop_path_rate=0.2).state_dict()
+    init = _small(depth=2, drop_path_rate=0.2).state_dict()
 
     def fresh():
-        model = _small(drop_path_rate=0.2)
+        model = _small(depth=2, drop_path_rate=0.2)
         model.load_state_dict(init)
         return model
+
+    assert fresh().blocks[-1].drop_path.p > 0  # stochastic depth really draws from the global RNG
 
     full = fresh()
     train(full, data, None, cfg, log=lambda s: None)
@@ -180,7 +183,8 @@ def test_resume_reproduces_an_uninterrupted_run_with_drop_path(tmp_path):
         train(fresh(), data, None, cfg, out_dir=str(tmp_path), log=interrupt_at_epoch_2)
     state = torch.load(tmp_path / "last.pt", weights_only=True)
     assert state["epoch"] == 1
-    resumed = _small(drop_path_rate=0.2)
+    resumed = _small(depth=2, drop_path_rate=0.2)
+    torch.manual_seed(999)  # a fresh process would have some other global RNG state
     train(resumed, data, None, cfg, resume=state, log=lambda s: None)
     for (name, a), b in zip(full.state_dict().items(), resumed.state_dict().values()):
         torch.testing.assert_close(a, b, rtol=0, atol=0, msg=name)
@@ -201,7 +205,7 @@ def test_resuming_a_finished_run_restores_low_bit_activations(tmp_path):
 
 def test_unfinished_quantization_ramp_is_rejected():
     cfg = TrainConfig(epochs=2, batch_size=32, warmup_epochs=0.5, fp_fraction=0.5, quant_ramp_epochs=2, log_every=0)
-    with pytest.raises(ValueError, match="never be fully"):
+    with pytest.raises(ValueError, match="no fully ternary"):
         train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)
 
 
@@ -214,7 +218,7 @@ def test_warmup_must_end_before_the_stage_switch():
 
 def test_rotated_scope_needs_hadamard_layers():
     cfg = TrainConfig(epochs=1, batch_size=32, schedule="cosine", warmup_epochs=0, final_act_bits=4,
-                      final_act_bits_scope="rotated", log_every=0)
+                      final_act_bits_fraction=0.5, final_act_bits_scope="rotated", log_every=0)
     with pytest.raises(ValueError, match="HBitLinear"):
         train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)
 
@@ -382,3 +386,53 @@ def test_cifar_download_path_extracts_and_checks_the_checksum(tmp_path, monkeypa
     train_set, test_set = load_cifar10(str(tmp_path), download=False)
     assert len(train_set) == 5 and test_set.labels.tolist() == [3]
     assert not (tmp_path / "evil.bin").exists()
+
+
+def test_full_precision_fraction_of_one_is_rejected():
+    cfg = TrainConfig(epochs=1, batch_size=32, schedule="cosine", warmup_epochs=0, fp_fraction=1.0, log_every=0)
+    with pytest.raises(ValueError, match="no fully ternary"):
+        train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)
+
+
+def test_low_bit_phase_that_rounds_to_zero_steps_is_rejected():
+    cfg = TrainConfig(epochs=1, batch_size=32, schedule="cosine", warmup_epochs=0, final_act_bits=4,
+                      final_act_bits_fraction=0.05, log_every=0)  # 5% of 2 steps rounds to 0
+    with pytest.raises(ValueError, match="no low-bit steps"):
+        train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)
+
+
+def test_resume_refuses_changed_training_settings(tmp_path):
+    cfg = TrainConfig(epochs=2, batch_size=32, warmup_epochs=0.5, log_every=0)
+    train(_small(), _colors(64, 0), None, cfg, out_dir=str(tmp_path), log=lambda s: None)
+    state = torch.load(tmp_path / "last.pt", weights_only=True)
+    with pytest.raises(ValueError, match="epochs"):
+        train(_small(), _colors(64, 0), None, TrainConfig(epochs=3, batch_size=32, warmup_epochs=0.5, log_every=0),
+              resume=state, log=lambda s: None)
+
+
+def test_gradient_clipping_is_applied_every_step(monkeypatch):
+    calls = []
+    original = torch.nn.utils.clip_grad_norm_
+
+    def spy(params, max_norm, *args, **kwargs):
+        params = list(params)
+        calls.append(max_norm)
+        out = original(params, max_norm, *args, **kwargs)
+        total = torch.sqrt(sum(p.grad.pow(2).sum() for p in params if p.grad is not None))
+        assert total <= max_norm * 1.001
+        return out
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy)
+    cfg = TrainConfig(epochs=1, batch_size=16, schedule="cosine", warmup_epochs=0, grad_clip=0.01, log_every=0)
+    train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)
+    assert calls == [0.01] * 4
+
+
+def test_label_smoothing_changes_the_loss():
+    def first_loss(smoothing):
+        torch.manual_seed(0)
+        cfg = TrainConfig(epochs=1, batch_size=64, schedule="cosine", warmup_epochs=0, label_smoothing=smoothing,
+                          augment=False, log_every=0)
+        return train(_small(), _colors(64, 0), None, cfg, log=lambda s: None)["epochs"][0]["train_loss"]
+
+    assert first_loss(0.0) != pytest.approx(first_loss(0.3))

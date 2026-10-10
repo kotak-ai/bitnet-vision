@@ -28,9 +28,10 @@ from bitnet_vision.checkpoint import (  # noqa: E402
     save_model,
     save_packed,
     transfer_weights,
+    upgrade_config,
 )
 from bitnet_vision.export import packed_state_dict_bytes  # noqa: E402
-from bitnet_vision.models import MODEL_PRESETS, create_model  # noqa: E402
+from bitnet_vision.models import MODEL_PRESETS, BitViT, BitViTConfig, create_model  # noqa: E402
 from bitnet_vision.training import TrainConfig, evaluate, load_cifar10, train  # noqa: E402
 from bitnet_vision.training.schedule import SCHEDULE_KINDS  # noqa: E402
 
@@ -104,7 +105,20 @@ def main(argv=None) -> dict:
                      drop_path_rate=a.drop_path, deadzone_lambda=a.deadzone_lambda,
                      hadamard_random_signs=not a.no_hadamard_signs)
     model = create_model(a.model, **overrides)
-    if a.init:
+
+    resume = None
+    last = os.path.join(a.out, "last.pt")
+    if a.resume and os.path.exists(last):
+        resume = torch.load(last, map_location="cpu", weights_only=True)
+        saved = BitViTConfig(**upgrade_config(resume["model_config"]))
+        # Activation bits may have been switched by the run itself (BitNet v2's final 4-bit phase).
+        differ = [f for f, v in model.config.to_dict().items()
+                  if f not in ("act_bits", "hadamard_act_bits") and getattr(saved, f) != v]
+        if differ:
+            raise SystemExit(f"--resume: the model flags differ from the checkpoint in {differ}; "
+                             "use the original command line or a new --out directory")
+        model = BitViT(saved)  # weights and the run's state are restored from last.pt by train()
+    elif a.init:
         transfer_weights(model, load_model(a.init))
         print(f"initialized from {a.init}")
     teacher = load_model(a.teacher) if a.teacher else None
@@ -121,22 +135,20 @@ def main(argv=None) -> dict:
         final_act_bits_scope=a.final_act_bits_scope,
         amp=a.amp, device=a.device, seed=a.seed, log_every=a.log_every,
     )
-    resume = None
-    last = os.path.join(a.out, "last.pt")
-    if a.resume and os.path.exists(last):
-        resume = torch.load(last, map_location="cpu", weights_only=True)
-    with open(os.path.join(a.out, "args.json"), "w") as f:
-        json.dump(vars(a), f, indent=1)
+    if resume is None:  # keep the original command line when resuming
+        with open(os.path.join(a.out, "args.json"), "w") as f:
+            json.dump(vars(a), f, indent=1)
 
     history = train(model, train_set, test_set, cfg, teacher=teacher, out_dir=a.out, resume=resume,
                     log=lambda s: print(s, flush=True))
     model.cpu()
     save_model(model, os.path.join(a.out, "model.pt"), train_config=cfg.to_dict())
 
-    summary = {"model": a.model, "quantized": not a.fp, "params": sum(p.numel() for p in model.parameters()),
+    n_params = sum(p.numel() for p in model.parameters())
+    summary = {"model": a.model, "quantized": model.config.quantize, "params": n_params,
                "final_test_acc": history["epochs"][-1].get("test_acc"),
                "fp32_state_bytes": packed_state_dict_bytes(model.state_dict())}
-    if not a.fp:
+    if model.config.quantize:
         payload = save_packed(model, os.path.join(a.out, "packed.pt"))
         packed = load_packed(os.path.join(a.out, "packed.pt"))
         summary["packed_state_bytes"] = packed_state_dict_bytes(payload["model"])
