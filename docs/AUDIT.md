@@ -2,8 +2,8 @@
 
 Before this rebuild the repository had three unmerged branches, each an independent attempt by an AI
 coding agent at the same task (BitLinear, RMSNorm, and a BitNet v2 HBitLinear). None contained any vision
-code. They were deleted after this rewrite. Their last commits, in case anything needs to be recovered
-(`git fetch origin <sha>` works while GitHub still keeps the objects):
+code. This rewrite supersedes them and they are meant to be deleted. Their last commits, in case anything
+needs to be recovered after deletion (`git fetch origin <sha>` works while GitHub still keeps the objects):
 
 | Branch | Last commit |
 |---|---|
@@ -71,7 +71,8 @@ Small 3-layer ternary MLPs trained on the same synthetic task, mean of 3 seeds:
 12. **Weak tests.** Planting plausible bugs in a copy of each branch, 8 of 13 survived 1bef's tests and 9 of
     14 survived 6825's (removing the straight-through estimator entirely still passed). 8216 had no tests.
     One 6825 test was unseeded and failed about 41% of the time on its own. 1bef's tests failed under a
-    plain `pytest` command.
+    plain `pytest` command. The same exercise on the rebuilt suite planted 25 bugs, including every bug
+    listed on this page, and all 25 were caught.
 13. **1bef rejected 4D inputs** such as channels-last image tensors, and crashed on empty batches.
 14. **No real savings.** All branches only simulated quantization: checkpoints were the same size as
     `nn.Linear` and inference was slower. Now `convert_for_inference` stores 2-bit packed weights
