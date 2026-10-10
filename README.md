@@ -98,7 +98,8 @@ python scripts/eval.py runs/ternary_kd/packed.pt
 python scripts/bench.py --checkpoint runs/ternary_kd/model.pt
 ```
 
-`scripts/cifar_experiments.sh` runs all three in sequence. Every run writes `metrics.json` (per-epoch
+`scripts/cifar_experiments.sh` runs all three in sequence, plus a fourth full-precision run with the
+same schedule as run 2, so the two differ only in quantization. Every run writes `metrics.json` (per-epoch
 accuracy and loss), `model.pt` and `summary.json`; ternary runs also record the share of weights at -1, 0
 and +1 and how many changed each epoch, and write the packed `packed.pt`. Interrupted runs continue with
 `--resume` and the original command line; the model is rebuilt from the checkpoint, and changed training
