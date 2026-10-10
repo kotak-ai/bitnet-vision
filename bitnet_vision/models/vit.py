@@ -3,7 +3,7 @@
 Kept in full precision, following TerViT (arXiv 2201.08050), ViT-1.58b and BitVLA: the convolutional
 patch embedding, cls token, position embeddings, final norm and classifier head. TerViT measured that
 quantizing the first and last layers to 2 bits costs DeiT-T 22 points of ImageNet accuracy, while they
-are under 4% of the parameters.
+are about 6% of its parameters (under 2% for the CIFAR presets).
 
 Ternary: qkv, attention output projection, MLP fc1 and fc2. Softmax attention runs in full precision.
 Norms sit in both places, as in FTerViT (arXiv 2605.21171), the strongest ternary ViT so far: the usual
@@ -17,6 +17,7 @@ and its weights can initialize or teach the ternary model because every paramete
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,15 +43,17 @@ class BitViTConfig:
     qkv_bias: bool = True
     proj_bias: bool = True
     mlp_bias: bool = True
-    mlp_act: str = "gelu"  # "gelu" or "relu2" (squared ReLU, used by BitNet b1.58 2B4T)
+    mlp_act: str = "gelu"  # "gelu" or "relu2" (squared ReLU; BitNet b1.58 2B4T uses it inside a gated MLP)
     quantize: bool = True  # False: same model in full precision (baseline / teacher)
     act_bits: int | None = 8
     weight_granularity: str = "tensor"
     hadamard: bool = False  # BitNet v2: HBitLinear for the attention output proj and MLP fc2
     hadamard_act_bits: int | None = 8  # activation bits of those HBitLinear layers (4 in BitNet v2 stage 2)
+    hadamard_random_signs: bool = True  # flip fixed random input signs before the rotation (see hadamard.py)
+    deadzone_lambda: float = 0.0  # Tequila dead-zone term in every BitLinear (paper default 1e-3); 0 = off
     block_norm: bool = True
     layer_scale_init: float | None = None  # e.g. 1e-4: learnable per-channel scale on each residual branch
-    pool: str = "cls"  # "cls" token or "mean" over patch tokens
+    pool: str = "cls"  # "cls" token, "mean" over patch tokens, or "seqpool" (learned attention pooling, CCT)
     drop_path_rate: float = 0.0
 
     def __post_init__(self) -> None:
@@ -58,10 +61,16 @@ class BitViTConfig:
             raise ValueError("embed_dim must be divisible by num_heads")
         if self.img_size % self.patch_size:
             raise ValueError("img_size must be divisible by patch_size")
-        if self.pool not in ("cls", "mean"):
-            raise ValueError(f"pool must be 'cls' or 'mean', got {self.pool!r}")
+        if self.pool not in ("cls", "mean", "seqpool"):
+            raise ValueError(f"pool must be 'cls', 'mean' or 'seqpool', got {self.pool!r}")
         if self.mlp_act not in ("gelu", "relu2"):
             raise ValueError(f"mlp_act must be 'gelu' or 'relu2', got {self.mlp_act!r}")
+        if self.quantize and self.act_bits is not None and self.act_bits < 8 and not self.hadamard:
+            warnings.warn(
+                "activations below 8 bits without hadamard=True: BitNet v2 found the attention output and MLP "
+                "down projection inputs need the Hadamard rotation at 4 bits",
+                stacklevel=3,
+            )
 
     @property
     def num_patches(self) -> int:
@@ -76,12 +85,12 @@ def _act_method(bits: int | None) -> str:
 
 
 def _bit_linear(cfg: BitViTConfig, d_in: int, d_out: int, bias: bool, rotated: bool = False) -> BitLinear:
+    common = dict(bias=bias, weight_granularity=cfg.weight_granularity, deadzone_lambda=cfg.deadzone_lambda)
     if rotated and cfg.hadamard:
         bits = cfg.hadamard_act_bits
-        return HBitLinear(d_in, d_out, bias=bias, act_bits=bits, act_method=_act_method(bits),
-                          weight_granularity=cfg.weight_granularity)
-    return BitLinear(d_in, d_out, bias=bias, act_bits=cfg.act_bits, act_method=_act_method(cfg.act_bits),
-                     weight_granularity=cfg.weight_granularity)
+        return HBitLinear(d_in, d_out, act_bits=bits, act_method=_act_method(bits),
+                          random_signs=cfg.hadamard_random_signs, **common)
+    return BitLinear(d_in, d_out, act_bits=cfg.act_bits, act_method=_act_method(cfg.act_bits), **common)
 
 
 class DropPath(nn.Module):
@@ -178,6 +187,7 @@ class BitViT(nn.Module):
         rates = torch.linspace(0, cfg.drop_path_rate, cfg.depth).tolist() if cfg.depth else []
         self.blocks = nn.ModuleList([Block(cfg, rates[i]) for i in range(cfg.depth)])
         self.norm = nn.LayerNorm(cfg.embed_dim)
+        self.seq_pool = nn.Linear(cfg.embed_dim, 1) if cfg.pool == "seqpool" else None
         self.head = nn.Linear(cfg.embed_dim, cfg.num_classes)
         self.reset_parameters()
         set_quant_strength(self, 1.0 if cfg.quantize else 0.0)
@@ -203,8 +213,14 @@ class BitViT(nn.Module):
         x = torch.cat([self.cls_token.expand(x.shape[0], -1, -1), x], dim=1) + self.pos_embed
         for block in self.blocks:
             x = block(x)
-        x = x[:, 0] if self.config.pool == "cls" else x[:, 1:].mean(dim=1)
-        return self.norm(x)
+        x = self.norm(x)
+        if self.config.pool == "cls":
+            return x[:, 0]
+        tokens = x[:, 1:]
+        if self.config.pool == "mean":
+            return tokens.mean(dim=1)
+        weights = torch.softmax(self.seq_pool(tokens), dim=1)  # (B, N, 1)
+        return (weights * tokens).sum(dim=1)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.head(self.forward_features(x))

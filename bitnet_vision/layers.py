@@ -14,6 +14,7 @@ inside the float16 range and gives the reference gradients: the scales are const
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Iterator
 
 import torch
@@ -73,11 +74,16 @@ class BitLinear(nn.Linear):
     Args:
         in_features, out_features, bias, device, dtype: as for ``nn.Linear``.
         act_bits: activation bits (8 in BitNet b1.58). ``None`` keeps activations in full precision.
-        act_method: "absmax" (default for 8 bits) or "absmean" (BitNet a4.8 / v2 recipe for 4 bits).
+        act_method: "absmax" or "absmean". Default: absmax for 8 or more bits, absmean below 8 bits
+            (the BitNet a4.8 / v2 recipe for 4-bit activations).
         weight_granularity: "tensor" (reference: one scale per matrix) or "channel" (one per output row).
         input_norm: put an RMSNorm in front of the quantizer, as the reference does. Turn it off only if
             the input is already normalized.
         norm_eps: epsilon of that RMSNorm.
+        deadzone_lambda: Tequila (arXiv 2509.23809). Weights whose ternary code is 0 get stuck there,
+            receiving only noisy straight-through gradients. A small value (1e-3 in the paper) adds
+            ``lambda * sum(dead weights of each output row)`` to the output, which gives those weights a
+            direct gradient and folds into the bias at export. 0 (default) is plain BitNet.
 
     Attributes:
         quant_strength: 1.0 = fully quantized (default), 0.0 = full precision with the same architecture
@@ -97,12 +103,15 @@ class BitLinear(nn.Linear):
         dtype: torch.dtype | None = None,
         *,
         act_bits: int | None = 8,
-        act_method: str = "absmax",
+        act_method: str | None = None,
         weight_granularity: str = "tensor",
         input_norm: bool = True,
         norm_eps: float = 1e-6,
+        deadzone_lambda: float = 0.0,
     ) -> None:
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        if act_method is None:
+            act_method = "absmax" if act_bits is None or act_bits >= 8 else "absmean"
         if act_bits is not None:
             fake_quant_activations(torch.zeros(1, 1), bits=act_bits, method=act_method)  # validate early
         if weight_granularity not in ("tensor", "channel"):
@@ -111,6 +120,7 @@ class BitLinear(nn.Linear):
         self.act_method = act_method
         self.weight_granularity = weight_granularity
         self.norm = RMSNorm(in_features, eps=norm_eps, device=device, dtype=dtype) if input_norm else None
+        self.deadzone_lambda = float(deadzone_lambda)
         self.quant_strength = 1.0
 
     def rotate(self, x: Tensor) -> Tensor:
@@ -118,6 +128,9 @@ class BitLinear(nn.Linear):
         return x
 
     def forward(self, x: Tensor) -> Tensor:
+        in_dtype = x.dtype
+        if in_dtype in (torch.float16, torch.bfloat16):
+            x = x.float()  # norm, rotation and rounding in float32, so codes match the exported model
         if self.norm is not None:
             x = self.norm(x)
         x = self.rotate(x)
@@ -127,7 +140,15 @@ class BitLinear(nn.Linear):
             if self.act_bits is not None:
                 x = ste(x, fake_quant_activations(x, self.act_bits, self.act_method), lam)
             w = ste(w, fake_quant_weights(w, self.weight_granularity), lam)
-        return F.linear(x, w, self.bias)
+        y = F.linear(x.to(in_dtype), w, self.bias)
+        if self.deadzone_lambda and lam > 0:
+            y = y + (lam * self.deadzone_lambda) * self.deadzone_rowsum().to(y.dtype)
+        return y
+
+    def deadzone_rowsum(self) -> Tensor:
+        """Per output row, the sum of latent weights whose ternary code is 0 (differentiable in the weights)."""
+        codes, _ = quantize_weights(self.weight.detach(), granularity=self.weight_granularity)
+        return (self.weight * (codes == 0).to(self.weight.dtype)).sum(dim=1)
 
     @torch.no_grad()
     def ternary_weight(self) -> tuple[Tensor, Tensor]:
@@ -143,19 +164,17 @@ class BitLinear(nn.Linear):
         computes the same function after (short) fine-tuning. HBitLinear rotates the copied weights so
         that, before quantization, it computes exactly what the original layer computed on its input.
         """
-        layer = cls(
-            linear.in_features,
-            linear.out_features,
-            bias=linear.bias is not None,
-            device=linear.weight.device,
-            dtype=linear.weight.dtype,
-            **kwargs,
-        )
+        kwargs.setdefault("device", linear.weight.device)
+        kwargs.setdefault("dtype", linear.weight.dtype)
+        layer = cls(linear.in_features, linear.out_features, bias=linear.bias is not None, **kwargs)
         with torch.no_grad():
             layer.weight.copy_(layer._weight_for_input_space(linear.weight))
             if linear.bias is not None:
                 layer.bias.copy_(linear.bias)
-        return layer
+        layer.weight.requires_grad_(linear.weight.requires_grad)
+        if layer.bias is not None:
+            layer.bias.requires_grad_(linear.bias.requires_grad)
+        return layer.train(linear.training)
 
     def _weight_for_input_space(self, weight: Tensor) -> Tensor:
         return weight
@@ -164,6 +183,7 @@ class BitLinear(nn.Linear):
         return (
             f"{super().extra_repr()}, act_bits={self.act_bits}, act_method={self.act_method}, "
             f"weight_granularity={self.weight_granularity}, input_norm={self.norm is not None}"
+            + (f", deadzone_lambda={self.deadzone_lambda}" if self.deadzone_lambda else "")
         )
 
 
@@ -172,7 +192,9 @@ class HBitLinear(BitLinear):
 
     The rotation spreads activation outliers across channels, which is what makes 4-bit activations
     workable (BitNet v2, arXiv 2504.18415). BitNet v2 uses it for the attention output projection and the
-    MLP down projection. ``act_method`` defaults to "absmax" for 8 bits and "absmean" below 8 bits.
+    MLP down projection. ``random_signs`` (default on) flips a fixed random set of input signs before the
+    Hadamard matrix, so mostly-positive inputs such as GELU outputs are not piled onto one coordinate (see
+    hadamard.py).
     """
 
     def __init__(
@@ -188,9 +210,9 @@ class HBitLinear(BitLinear):
         weight_granularity: str = "tensor",
         input_norm: bool = True,
         norm_eps: float = 1e-6,
+        deadzone_lambda: float = 0.0,
+        random_signs: bool = True,
     ) -> None:
-        if act_method is None:
-            act_method = "absmax" if act_bits is None or act_bits >= 8 else "absmean"
         super().__init__(
             in_features,
             out_features,
@@ -202,8 +224,9 @@ class HBitLinear(BitLinear):
             weight_granularity=weight_granularity,
             input_norm=input_norm,
             norm_eps=norm_eps,
+            deadzone_lambda=deadzone_lambda,
         )
-        self.hadamard = HadamardTransform(in_features)
+        self.hadamard = HadamardTransform(in_features, random_signs=random_signs)
         if device is not None:
             self.hadamard.to(device)
 
@@ -211,7 +234,7 @@ class HBitLinear(BitLinear):
         return self.hadamard(x)
 
     def _weight_for_input_space(self, weight: Tensor) -> Tensor:
-        # y = x W^T = (x H)(W H)^T because H H^T = I, so rotated inputs need weights W H.
+        # y = x W^T = (x R)(W R)^T because R R^T = I, so rotated inputs need weights W R.
         return self.hadamard(weight)
 
 
@@ -234,15 +257,22 @@ def convert_linear_layers(
     layer_cls: type[BitLinear] = BitLinear,
     **kwargs,
 ) -> nn.Module:
-    """Replace every ``nn.Linear`` in ``model`` (in place) by ``layer_cls.from_linear``.
+    """Replace every plain ``nn.Linear`` in ``model`` (in place) by ``layer_cls.from_linear``.
 
     ``exclude`` lists qualified module names (or prefixes) to keep in full precision, for example the
-    classifier head. Returns ``model``.
+    classifier head. A Linear shared by several parents stays shared. Subclasses of nn.Linear and the
+    projections inside ``nn.MultiheadAttention`` (whose input projection is a raw parameter) are left
+    alone, with a warning for the latter. Returns ``model``.
     """
     exclude = tuple(exclude)
-    for name, module in list(model.named_modules()):
-        for child_name, child in list(module.named_children()):
+    replaced: dict[int, BitLinear] = {}
+    if any(isinstance(m, nn.MultiheadAttention) for m in model.modules()):
+        warnings.warn("nn.MultiheadAttention layers are not converted and stay in full precision", stacklevel=2)
+    for name, module in list(model.named_modules(remove_duplicate=False)):
+        for child_name, child in list(module._modules.items()):  # includes repeated (shared) children
             full = f"{name}.{child_name}" if name else child_name
             if type(child) is nn.Linear and not any(full == e or full.startswith(e + ".") for e in exclude):
-                setattr(module, child_name, layer_cls.from_linear(child, **kwargs))
+                if id(child) not in replaced:
+                    replaced[id(child)] = layer_cls.from_linear(child, **kwargs)
+                setattr(module, child_name, replaced[id(child)])
     return model

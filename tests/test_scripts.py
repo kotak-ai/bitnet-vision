@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 
+import pytest
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,20 +28,27 @@ def _fake_cifar(root, per_file=40):
             f.write(bytes(torch.cat([labels[:, None], pixels], 1).flatten().tolist()))
 
 
+@pytest.mark.slow
 def test_train_eval_and_bench_scripts(tmp_path):
     data = str(tmp_path / "data")
     _fake_cifar(data)
     train = _load_script("train")
     fp_out = str(tmp_path / "fp")
     summary = train.main(["--data-dir", data, "--out", fp_out, "--fp", "--epochs", "1", "--batch-size", "50",
-                          "--log-every", "0"])
+                          "--schedule", "cosine", "--warmup-epochs", "0", "--log-every", "0"])
     assert summary["quantized"] is False
+    again = str(tmp_path / "fp_again")  # same --seed must give the same weights
+    train.main(["--data-dir", data, "--out", again, "--fp", "--epochs", "1", "--batch-size", "50",
+                "--schedule", "cosine", "--warmup-epochs", "0", "--log-every", "0"])
+    first = torch.load(os.path.join(fp_out, "model.pt"), weights_only=True)["model"]
+    second = torch.load(os.path.join(again, "model.pt"), weights_only=True)["model"]
+    assert all(torch.equal(first[k], second[k]) for k in first)
 
     out = str(tmp_path / "ternary")
     summary = train.main(["--data-dir", data, "--out", out, "--epochs", "1", "--batch-size", "50", "--log-every",
                           "0", "--init", f"{fp_out}/model.pt", "--teacher", f"{fp_out}/model.pt", "--hadamard",
-                          "--schedule", "restart", "--quant-ramp-epochs", "0.5",
-                          "--final-hadamard-act-bits", "4", "--final-act-bits-fraction", "0.5"])
+                          "--schedule", "restart", "--warmup-epochs", "0", "--quant-ramp-epochs", "0.5",
+                          "--final-act-bits", "4", "--final-act-bits-fraction", "0.5"])
     assert summary["compression"] > 10
     assert summary["packed_test_acc"] == summary["final_test_acc"] or abs(
         summary["packed_test_acc"] - summary["final_test_acc"]) <= 0.05
@@ -48,7 +56,8 @@ def test_train_eval_and_bench_scripts(tmp_path):
         assert os.path.exists(os.path.join(out, f))
     with open(os.path.join(out, "metrics.json")) as fh:
         cfg = json.load(fh)["model_config"]
-    assert cfg["hadamard"] is True and cfg["hadamard_act_bits"] == 4  # switched to 4-bit for the last steps
+    # switched to 4-bit activations (all layers, as in BitNet v2) for the last steps
+    assert cfg["hadamard"] is True and cfg["hadamard_act_bits"] == 4 and cfg["act_bits"] == 4
 
     evaluate = _load_script("eval")
     info = evaluate.main([os.path.join(out, "packed.pt"), "--data-dir", data])
@@ -57,5 +66,9 @@ def test_train_eval_and_bench_scripts(tmp_path):
     assert info["kind"] == "training" and info["acc"] == summary["final_test_acc"]
 
     bench = _load_script("bench")
-    res = bench.main(["--batch-size", "2", "--repeats", "1"])
-    assert res["bytes_fp32"] / res["bytes_packed"] > 10
+    res = bench.main(["--checkpoint", os.path.join(out, "model.pt"), "--batch-sizes", "2", "--threads", "1",
+                      "--repeats", "1"])
+    assert res["bytes_fp32_state"] / res["bytes_packed_state"] > 10
+    run = res["runs"][0]
+    assert set(run["ms"]) == {"fp32", "ternary_training_mode", "packed_int8", "packed_float_matmul"}
+    assert run["packed_vs_training_argmax_agreement"] >= 0.5

@@ -1,8 +1,11 @@
 """Microsoft's published BitNet b1.58 reference recipe, used as the ground truth in tests.
 
-Copied from "The Era of 1-bit LLMs: Training Tips, Code and FAQ" (Fig. 3,
-https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf).
-The only addition is an optional bias, added by F.linear after both quantizers (the reference has none).
+activation_quant, weight_quant and the straight-through structure of bitlinear_forward are copied verbatim
+from "The Era of 1-bit LLMs: Training Tips, Code and FAQ" (Fig. 3,
+https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf),
+Copyright (c) Microsoft Corporation, MIT License (https://github.com/microsoft/unilm/blob/master/LICENSE).
+The PDF calls RMSNorm without defining it; rms_norm below is a standard LLaMA-style RMSNorm (eps 1e-6,
+learnable weight). An optional bias is added by F.linear after both quantizers (the reference has none).
 """
 
 import torch

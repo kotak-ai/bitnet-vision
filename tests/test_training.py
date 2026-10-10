@@ -41,6 +41,13 @@ def test_restart_schedule_has_short_low_lr_second_phase():
     assert 1e-5 <= s(99)[0] < 1e-4
 
 
+def test_wsd_schedule_holds_then_cools_down():
+    s = TwoStageSchedule(total_steps=100, peak_lr=1e-3, kind="wsd", warmup_steps=5, weight_decay=0.05)
+    assert [s(t)[0] for t in (5, 50, 89)] == [pytest.approx(1e-3)] * 3
+    assert s(89)[1] == 0.05 and s(90)[1] == 0.0
+    assert s(95)[0] == pytest.approx(5e-4) and s(99)[0] < 5e-5  # cosine over the last 10 steps
+
+
 @pytest.mark.parametrize("kind", ["cosine", "linear"])
 def test_single_stage_schedules(kind):
     s = TwoStageSchedule(total_steps=50, peak_lr=1e-3, kind=kind, weight_decay=0.05)
@@ -121,6 +128,7 @@ def _blobs(n, seed):
     return TensorDataset(images.clamp(0, 255).to(torch.uint8), labels)
 
 
+@pytest.mark.slow
 def test_train_loop_learns_and_keeps_ternary_codes_healthy(tmp_path):
     torch.manual_seed(0)
     model = create_model("bitvit_cifar_tiny", depth=2, embed_dim=96, num_heads=2, num_classes=4)
@@ -138,13 +146,15 @@ def test_train_loop_learns_and_keeps_ternary_codes_healthy(tmp_path):
     assert [e["epoch"] for e in hist2["epochs"]] == [1, 2, 3, 4]
 
 
+@pytest.mark.slow
 def test_distilled_training_from_full_precision_init():
     torch.manual_seed(0)
     teacher = create_model("bitvit_cifar_tiny", depth=2, embed_dim=96, num_heads=2, num_classes=4, quantize=False)
-    train(teacher, _blobs(256, 0), None, TrainConfig(epochs=2, batch_size=32, log_every=0), log=lambda s: None)
+    train(teacher, _blobs(256, 0), None, TrainConfig(epochs=2, batch_size=32, warmup_epochs=0.5, log_every=0),
+          log=lambda s: None)
     student = create_model("bitvit_cifar_tiny", depth=2, embed_dim=96, num_heads=2, num_classes=4)
     student.load_state_dict(teacher.state_dict())
-    cfg = TrainConfig(epochs=2, batch_size=32, lr=1e-3, quant_ramp_epochs=1.0, log_every=0)
+    cfg = TrainConfig(epochs=2, batch_size=32, lr=1e-3, quant_ramp_epochs=1.0, warmup_epochs=0.5, log_every=0)
     hist = train(student, _blobs(256, 0), _blobs(128, 1), cfg, teacher=teacher, log=lambda s: None)
     assert hist["epochs"][-1]["test_acc"] > 0.9
     assert all(m.quant_strength == 1.0 for m in student.modules() if isinstance(m, BitLinear))
@@ -160,17 +170,18 @@ def test_evaluate_and_ternary_stats():
 
 def test_bf16_autocast_training_step():
     model = create_model("bitvit_cifar_tiny", depth=1, embed_dim=96, num_heads=2, num_classes=4)
-    cfg = TrainConfig(epochs=1, batch_size=16, amp="bf16", log_every=0)
+    cfg = TrainConfig(epochs=1, batch_size=16, amp="bf16", schedule="cosine", warmup_epochs=0.5, log_every=0)
     hist = train(model, _blobs(32, 0), _blobs(16, 1), cfg, log=lambda s: None)
     assert hist["epochs"][0]["train_loss"] > 0
 
 
+@pytest.mark.slow
 def test_fp_first_then_ternary_and_late_4bit_switch():
     from bitnet_vision.layers import HBitLinear
 
     torch.manual_seed(0)
     model = create_model("bitvit_cifar_tiny", depth=1, embed_dim=96, num_heads=2, num_classes=4, hadamard=True)
-    cfg = TrainConfig(epochs=4, batch_size=32, fp_fraction=0.5, final_hadamard_act_bits=4,
+    cfg = TrainConfig(epochs=4, batch_size=32, fp_fraction=0.5, final_act_bits=4, final_act_bits_scope="rotated",
                       final_act_bits_fraction=0.25, log_every=0)
     hist = train(model, _blobs(64, 0), _blobs(32, 1), cfg, log=lambda s: None)
     strengths = [e["quant_strength"] for e in hist["epochs"]]
@@ -179,3 +190,15 @@ def test_fp_first_then_ternary_and_late_4bit_switch():
     assert h_layers and all(m.act_bits == 4 and m.act_method == "absmean" for m in h_layers)
     assert model.config.hadamard_act_bits == 4 and hist["model_config"]["hadamard_act_bits"] == 4
     assert all(m.act_bits == 8 for m in model.modules() if isinstance(m, BitLinear) and not isinstance(m, HBitLinear))
+
+
+@pytest.mark.slow
+def test_final_low_bit_switch_scope_all_changes_every_layer_and_the_config():
+    torch.manual_seed(0)
+    model = create_model("bitvit_cifar_tiny", depth=1, embed_dim=96, num_heads=2, num_classes=4, hadamard=True)
+    cfg = TrainConfig(epochs=2, batch_size=32, final_act_bits=4, final_act_bits_fraction=0.5, warmup_epochs=0.5,
+                      log_every=0)
+    train(model, _blobs(64, 0), None, cfg, log=lambda s: None)
+    layers = [m for m in model.modules() if isinstance(m, BitLinear)]
+    assert all(m.act_bits == 4 and m.act_method == "absmean" for m in layers)
+    assert model.config.act_bits == 4 and model.config.hadamard_act_bits == 4

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Reproduce the CIFAR-10 results in the README: a full-precision baseline, a ternary model trained from
-# scratch, and a ternary model initialized from and distilled by the baseline.
+# CIFAR-10 experiments: a full-precision baseline, a ternary model trained from scratch, and a ternary
+# model initialized from and distilled by the baseline.
 #
 #   DATA=data OUT=runs EPOCHS=15 THREADS=4 bash scripts/cifar_experiments.sh
 #
@@ -30,7 +30,7 @@ run fp --fp --epochs "$EPOCHS" --schedule cosine --lr 1e-3 --wd 0.05
 # 2) ternary from scratch, BitNet b1.58 two-stage schedule (lr x2/3 and weight decay off at the midpoint)
 run ternary_scratch --epochs "$EPOCHS" --schedule bitnet --lr 1e-3 --wd 0.1
 
-# 3) ternary initialized from the fp run and distilled from it (KL only, T=1), with FTerViT's short
-#    low-lr restart for the last 10% of steps
+# 3) ternary initialized from the fp run and distilled from it (90% KL at T=1, 10% cross-entropy), with
+#    FTerViT's short low-lr restart for the last 10% of steps
 run ternary_kd --epochs "$KD_EPOCHS" --init "$OUT/fp/model.pt" --teacher "$OUT/fp/model.pt" \
   --schedule restart --lr 2e-4 --wd 0.05 --stage2-wd 0.01 --warmup-epochs 0.5

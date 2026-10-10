@@ -49,7 +49,10 @@ def parse_args(argv=None):
                    "RMSNorm inside each BitLinear, as in the BitNet LLM recipe)")
     p.add_argument("--layer-scale", type=float, default=None, help="LayerScale init, e.g. 1e-4")
     p.add_argument("--mlp-act", default="gelu", choices=["gelu", "relu2"])
-    p.add_argument("--pool", default="cls", choices=["cls", "mean"])
+    p.add_argument("--pool", default="cls", choices=["cls", "mean", "seqpool"])
+    p.add_argument("--deadzone-lambda", type=float, default=0.0, help="Tequila dead-zone term, e.g. 1e-3")
+    p.add_argument("--no-hadamard-signs", action="store_true",
+                   help="plain (unsigned) Hadamard rotation as in BitNet v2, instead of the randomized one")
     p.add_argument("--drop-path", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=128)
@@ -65,14 +68,16 @@ def parse_args(argv=None):
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--init", default=None, help="checkpoint to initialize weights from (e.g. the fp run)")
     p.add_argument("--teacher", default=None, help="checkpoint of a full-precision teacher for distillation")
-    p.add_argument("--distill-alpha", type=float, default=1.0)
+    p.add_argument("--distill-alpha", type=float, default=0.9, help="KL weight; 1.0 = KL only (FTerViT)")
     p.add_argument("--distill-temperature", type=float, default=1.0)
     p.add_argument("--fp-fraction", type=float, default=0.0,
                    help="train this share of steps in full precision, then switch to ternary")
     p.add_argument("--quant-ramp-epochs", type=float, default=0.0)
-    p.add_argument("--final-hadamard-act-bits", type=int, default=None,
-                   help="BitNet v2: switch HBitLinear activations to this many bits near the end (e.g. 4)")
+    p.add_argument("--final-act-bits", type=int, default=None,
+                   help="BitNet v2: switch activations to this many bits (e.g. 4) for the end of training")
     p.add_argument("--final-act-bits-fraction", type=float, default=0.05)
+    p.add_argument("--final-act-bits-scope", default="all", choices=["all", "rotated"],
+                   help="all BitLinear layers (BitNet v2) or only the Hadamard ones")
     p.add_argument("--amp", default=None, choices=["bf16"])
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--threads", type=int, default=None)
@@ -86,6 +91,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> dict:
     a = parse_args(argv)
+    torch.manual_seed(a.seed)  # before building the model, so --seed fixes the initial weights too
     if a.threads:
         torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
@@ -95,12 +101,15 @@ def main(argv=None) -> dict:
     overrides = dict(quantize=not a.fp, hadamard=a.hadamard, act_bits=a.act_bits,
                      hadamard_act_bits=a.hadamard_act_bits, weight_granularity=a.weight_granularity,
                      block_norm=not a.no_block_norm, layer_scale_init=a.layer_scale, mlp_act=a.mlp_act, pool=a.pool,
-                     drop_path_rate=a.drop_path)
+                     drop_path_rate=a.drop_path, deadzone_lambda=a.deadzone_lambda,
+                     hadamard_random_signs=not a.no_hadamard_signs)
     model = create_model(a.model, **overrides)
     if a.init:
         transfer_weights(model, load_model(a.init))
         print(f"initialized from {a.init}")
-    teacher = load_model(a.teacher, quantize=False) if a.teacher else None
+    teacher = load_model(a.teacher) if a.teacher else None
+    if teacher is not None and teacher.config.quantize:
+        print(f"note: teacher {a.teacher} is a ternary model; it is used as trained (quantized)")
 
     cfg = TrainConfig(
         epochs=a.epochs, batch_size=a.batch_size, lr=a.lr, schedule=a.schedule, split=a.split,
@@ -108,7 +117,8 @@ def main(argv=None) -> dict:
         weight_decay=a.wd, stage2_weight_decay=a.stage2_wd, label_smoothing=a.label_smoothing,
         augment=not a.no_augment, distill_alpha=a.distill_alpha, distill_temperature=a.distill_temperature,
         fp_fraction=a.fp_fraction, quant_ramp_epochs=a.quant_ramp_epochs,
-        final_hadamard_act_bits=a.final_hadamard_act_bits, final_act_bits_fraction=a.final_act_bits_fraction,
+        final_act_bits=a.final_act_bits, final_act_bits_fraction=a.final_act_bits_fraction,
+        final_act_bits_scope=a.final_act_bits_scope,
         amp=a.amp, device=a.device, seed=a.seed, log_every=a.log_every,
     )
     resume = None

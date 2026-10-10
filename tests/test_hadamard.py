@@ -5,6 +5,7 @@ import torch
 
 from bitnet_vision.hadamard import (
     HadamardTransform,
+    fixed_random_signs,
     hadamard_factors,
     hadamard_matrix,
     paley_hadamard,
@@ -88,3 +89,26 @@ def test_transform_spreads_an_outlier():
     x[0, 5] = 100.0
     y = HadamardTransform(768)(x)
     assert y.abs().max() < 100.0 / 768**0.5 + 1e-3
+
+
+@pytest.mark.parametrize("n", [192, 768, 3072])
+def test_random_signs_keep_an_exact_rotation(n):
+    t = HadamardTransform(n, random_signs=True)
+    r = t.matrix()
+    torch.testing.assert_close(r @ r.T, torch.eye(n, dtype=torch.float64), atol=1e-12, rtol=0)
+    expected = torch.diag(fixed_random_signs(n)) @ hadamard_matrix(n)
+    torch.testing.assert_close(r, expected, atol=1e-12, rtol=0)
+    assert torch.equal(HadamardTransform(n, random_signs=True).signs, t.signs)  # deterministic
+
+
+def test_random_signs_stop_positive_inputs_from_piling_onto_one_coordinate():
+    """GELU outputs are mostly positive; an unsigned Hadamard turns their mean into one huge outlier."""
+    torch.manual_seed(0)
+    x = torch.nn.functional.gelu(torch.randn(256, 768))
+
+    def crest(y):  # largest value relative to the RMS, per token (what absmax quantization pays for)
+        return (y.abs().amax(-1) / y.pow(2).mean(-1).sqrt()).mean().item()
+
+    plain, signed = crest(HadamardTransform(768)(x)), crest(HadamardTransform(768, random_signs=True)(x))
+    assert plain > 2 * signed
+    assert signed < crest(x)

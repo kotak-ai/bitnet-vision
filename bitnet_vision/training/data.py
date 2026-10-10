@@ -73,15 +73,20 @@ def _download_and_extract(root: str) -> None:
             src = tar.extractfile(m)
             dst = os.path.join(root, *m.name.split("/"))
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst, "wb") as out:
+            with open(dst + ".part", "wb") as out:
                 out.write(src.read())
+            os.replace(dst + ".part", dst)
 
 
 def _read_batches(folder: str, files: list[str]) -> TensorDataset:
     blobs = []
     for f in files:
         with open(os.path.join(folder, f), "rb") as fh:
-            blobs.append(fh.read())
+            blob = fh.read()
+        if len(blob) == 0 or len(blob) % _RECORD:
+            raise ValueError(f"{f} has {len(blob)} bytes, not a whole number of {_RECORD}-byte records; "
+                             "delete the cifar-10-batches-bin folder and load again")
+        blobs.append(blob)
     raw = torch.frombuffer(bytearray(b"".join(blobs)), dtype=torch.uint8).view(-1, _RECORD)
     labels = raw[:, 0].long()
     images = raw[:, 1:].reshape(-1, 3, 32, 32).clone()

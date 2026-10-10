@@ -7,10 +7,17 @@ Kinds:
   midpoint) it is multiplied by ``stage2_factor`` (2/3, e.g. 1.5e-3 -> 1e-3 peaks) and weight decay
   switches from ``weight_decay`` to ``stage2_weight_decay`` (0). Weight decay pulls latent weights toward
   zero, where they keep flipping codes, so removing it lets the codes settle.
-* ``"bitnet_cosine"``: the same with cosine curves (BitNet b1.58 2B4T, arXiv 2504.12285).
+* ``"bitnet_cosine"``: the same with cosine curves, an approximation inspired by BitNet b1.58 2B4T
+  (arXiv 2504.12285), which also uses a cosine weight-decay schedule in stage 1 and a separately chosen
+  stage-2 peak.
 * ``"restart"``: FTerViT (arXiv 2605.21171): a cosine main phase until ``split`` (0.9), then a short restart
   at ``restart_lr_ratio * peak_lr`` (0.1) that cosine-decays to a tenth of that, with
-  ``stage2_weight_decay``. FTerViT's 10-epoch restart added 1.6 to 3.5 points and beat 150 extra epochs.
+  ``stage2_weight_decay``. FTerViT's 10-epoch restart added 0 to 3.8 points (0 on CIFAR-10, 1.6 on
+  CIFAR-100); the gain shrank the longer the main phase ran, so it behaves much like a final annealing.
+* ``"wsd"``: warmup, hold ``peak_lr`` until ``split`` (0.9), then a cosine cooldown to ``min_lr`` with
+  ``stage2_weight_decay``. "Linger and Lose" (arXiv 2609.32902) found that small ternary transformers
+  lose capacity while lingering at mid-range learning rates under cosine decay, and a 10% WSD cooldown
+  avoided it (shown on language models; untested on vision).
 * ``"cosine"`` / ``"linear"``: one decay from ``peak_lr`` to ``min_lr`` with constant weight decay.
 """
 
@@ -21,8 +28,8 @@ from dataclasses import dataclass
 
 __all__ = ["TwoStageSchedule", "SCHEDULE_KINDS"]
 
-SCHEDULE_KINDS = ("bitnet", "bitnet_cosine", "restart", "cosine", "linear")
-_DEFAULT_SPLIT = {"bitnet": 0.5, "bitnet_cosine": 0.5, "restart": 0.9}
+SCHEDULE_KINDS = ("bitnet", "bitnet_cosine", "restart", "wsd", "cosine", "linear")
+_DEFAULT_SPLIT = {"bitnet": 0.5, "bitnet_cosine": 0.5, "restart": 0.9, "wsd": 0.9}
 
 
 def _decay(start: float, end: float, frac: float, shape: str) -> float:
@@ -56,6 +63,10 @@ class TwoStageSchedule:
             self.split = _DEFAULT_SPLIT.get(self.kind, 1.0)
         if not 0.0 < self.split <= 1.0:
             raise ValueError("split must be in (0, 1]")
+        limit = self.split_step if self.two_stage else self.total_steps
+        if self.warmup_steps >= limit:
+            raise ValueError(f"warmup ({self.warmup_steps} steps) must end before "
+                             f"{'the stage switch' if self.two_stage else 'the end of training'} ({limit} steps)")
 
     @property
     def two_stage(self) -> bool:
@@ -77,8 +88,13 @@ class TwoStageSchedule:
             shape = "linear" if self.kind == "bitnet" else "cosine"
             lr = _decay(self.peak_lr, self.min_lr, frac, shape)
             return (lr * self.stage2_factor if stage2 else lr), wd
-        # restart
         split = self.split_step
+        if self.kind == "wsd":
+            if not stage2:
+                return self.peak_lr, wd
+            f = (step - split) / max(1, self.total_steps - split)
+            return _decay(self.peak_lr, self.min_lr, f, "cosine"), wd
+        # restart
         if not stage2:
             f = (step - self.warmup_steps) / max(1, split - self.warmup_steps)
             return _decay(self.peak_lr, self.min_lr, f, "cosine"), wd

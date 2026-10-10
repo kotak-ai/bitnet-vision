@@ -75,7 +75,11 @@ def quantize_activations(
 def fake_quant_activations(x: Tensor, bits: int = 8, method: str = "absmax", eps: float = QUANT_EPS) -> Tensor:
     """Quantize then dequantize activations; same shape and dtype as ``x``. No gradient flows through it."""
     codes, scale = quantize_activations(x.detach(), bits=bits, method=method, eps=eps)
-    return (codes / scale).to(x.dtype)
+    out = codes / scale
+    if x.dtype in (torch.float16, torch.bfloat16):  # absmean codes can overshoot a huge value by up to 2x
+        limit = torch.finfo(x.dtype).max
+        out = out.clamp(-limit, limit)
+    return out.to(x.dtype)
 
 
 def quantize_weights(w: Tensor, granularity: str = "tensor", eps: float = QUANT_EPS) -> tuple[Tensor, Tensor]:

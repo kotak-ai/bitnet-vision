@@ -13,13 +13,23 @@ split into small Sylvester factors. Each factor is applied with one small matmul
 O(n * sum(factor sizes)) per token, and autograd handles the backward pass.
 This is the same idea as QuaRot's and Dao-AILab fast-hadamard-transform's 12N/20N kernels.
 
+Random signs: an unsigned Hadamard matrix maps a vector's mean onto a single coordinate (its first column
+is constant for Sylvester matrices and nearly so for Paley ones). After GELU, ViT MLP activations are
+mostly positive, so a plain rotation *creates* one huge outlier per token instead of removing them; a
+fact-check measured 4-bit error 0.31 vs 0.11 with signs on a 768-wide GELU input. Flipping a fixed random
+set of input signs first (``random_signs=True``, the randomized Hadamard of QuaRot, arXiv 2404.00456)
+removes the problem and keeps the map an exact rotation. BitNet v2 uses an unsigned matrix because its
+LLM inputs are roughly zero-mean.
+
 Widths with no such decomposition fall back to a fixed, seeded random orthogonal matrix (with a warning).
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
+import random
 import warnings
 
 import torch
@@ -30,6 +40,7 @@ __all__ = [
     "paley_hadamard",
     "hadamard_factors",
     "hadamard_matrix",
+    "fixed_random_signs",
     "HadamardTransform",
 ]
 
@@ -125,61 +136,102 @@ def hadamard_matrix(n: int, dtype: torch.dtype = torch.float64) -> Tensor:
     return (h / math.sqrt(n)).to(dtype)
 
 
-class HadamardTransform(nn.Module):
-    """Computes ``x @ H`` along the last dimension, where H is an exact orthonormal n x n rotation.
+def autocast_disabled(device_type: str):
+    """Context manager that turns autocast off on devices that support it (no-op elsewhere, e.g. meta)."""
+    if device_type in ("cpu", "cuda", "xpu"):
+        return torch.autocast(device_type=device_type, enabled=False)
+    return contextlib.nullcontext()
 
-    The transform always runs in float32 (or float64 for float64 inputs) and returns the input dtype:
-    running each matmul in bfloat16 adds error comparable to the 8-bit rounding that follows.
+
+def fixed_random_signs(n: int, seed: int = 0) -> Tensor:
+    """A fixed vector of n random +-1 values (float64). Uses Python's ``random`` so it never depends on the
+    torch version or device, which keeps exported models reproducible."""
+    rng = random.Random(seed)
+    return torch.tensor([1.0 if rng.getrandbits(1) else -1.0 for _ in range(n)], dtype=torch.float64)
+
+
+class HadamardTransform(nn.Module):
+    """Computes ``x @ R`` along the last dimension, where R is an exact orthonormal n x n rotation.
+
+    ``R = H`` (a Hadamard matrix scaled by 1/sqrt(n)), or ``R = diag(s) @ H`` with fixed random signs ``s``
+    when ``random_signs=True``. The transform always runs in float32 (or float64 for float64 inputs), also
+    under autocast, and returns the input dtype: running the matmuls in bfloat16 adds error comparable to
+    the 8-bit rounding that follows (and flips many 4-bit codes).
+
+    The buffers are not saved in checkpoints; they are rebuilt from exact float64 copies whenever the
+    module is created, moved or cast, so half-precision casts and ``to_empty`` never degrade the rotation.
     """
 
-    def __init__(self, n: int, seed: int = 0) -> None:
+    def __init__(self, n: int, seed: int = 0, random_signs: bool = False) -> None:
         super().__init__()
         self.n = int(n)
-        factors = hadamard_factors(self.n)
-        if factors is None:
-            warnings.warn(
-                f"width {self.n} has no exact Hadamard construction; using a fixed random orthogonal "
-                "matrix instead (dense, O(n^2) per token). Prefer widths of the form 2^k, 12*2^k or 20*2^k.",
-                stacklevel=2,
-            )
-            g = torch.Generator().manual_seed(seed)
-            q, r = torch.linalg.qr(torch.randn(self.n, self.n, generator=g, dtype=torch.float64))
-            q = q * torch.sign(torch.diagonal(r)).unsqueeze(0)
-            mats = [q]
-            self.exact = False
-        else:
-            mats = [_factor_matrix(f) / math.sqrt(f) for f in factors]
-            self.exact = True
+        self.seed = int(seed)
+        self.random_signs = bool(random_signs)
+        with torch.device("cpu"):  # never let a default or meta device context capture the exact values
+            factors = hadamard_factors(self.n)
+            if factors is None:
+                warnings.warn(
+                    f"width {self.n} has no exact Hadamard construction; using a fixed random orthogonal "
+                    "matrix instead (dense, O(n^2) per token). Prefer widths of the form 2^k, 12*2^k or "
+                    "20*2^k.",
+                    stacklevel=2,
+                )
+                g = torch.Generator().manual_seed(seed)
+                q, r = torch.linalg.qr(torch.randn(self.n, self.n, generator=g, dtype=torch.float64))
+                mats = [q * torch.sign(torch.diagonal(r)).unsqueeze(0)]
+                self.exact = False
+            else:
+                mats = [_factor_matrix(f) / math.sqrt(f) for f in factors]
+                self.exact = True
+            self._exact: dict[str, Tensor] = {f"factor{i}": m for i, m in enumerate(mats)}
+            if self.random_signs:
+                self._exact["signs"] = fixed_random_signs(self.n, self.seed)
         self.factor_sizes = tuple(m.shape[0] for m in mats)
-        # Non-persistent: rebuilt deterministically, so checkpoints stay small and backward compatible.
-        for i, m in enumerate(mats):
-            self.register_buffer(f"factor{i}", m.to(torch.float32), persistent=False)
         self._num_factors = len(mats)
-        self._mats64 = mats  # exact float64 copies (CPU), used for float64 inputs such as gradchecks
+        for name, exact in self._exact.items():
+            self.register_buffer(name, exact.to(torch.float32), persistent=False)
 
-    def _apply(self, fn, recurse=True):  # keep factors in float32 when the module is cast to half precision
+    def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse)
-        for i in range(self._num_factors):
-            buf = getattr(self, f"factor{i}")
-            if buf.dtype not in (torch.float32, torch.float64):
-                setattr(self, f"factor{i}", buf.float())
+        # Rewrite every buffer from its exact copy on the buffer's new device: float64 if the module was cast
+        # to float64, float32 otherwise (never the rounded half-precision values).
+        for name, exact in self._exact.items():
+            buf = getattr(self, name)
+            if buf.device.type == "meta":
+                continue
+            if buf.dtype in (torch.float32, torch.float64):
+                buf.copy_(exact)  # in place, so shared or pinned memory stays shared or pinned
+            else:
+                setattr(self, name, exact.to(device=buf.device, dtype=torch.float32))
         return self
 
     def forward(self, x: Tensor) -> Tensor:
         if x.shape[-1] != self.n:
             raise ValueError(f"expected last dim {self.n}, got {x.shape[-1]}")
         dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+
+        def buffer(name: str) -> Tensor:
+            buf = getattr(self, name)
+            if dtype == torch.float64 and buf.dtype != torch.float64:
+                return self._exact[name].to(x.device)  # exact values for float64 inputs (e.g. gradchecks)
+            return buf.to(device=x.device, dtype=dtype)
+
         lead = x.shape[:-1]
-        y = x.to(dtype).reshape(*lead, *self.factor_sizes)
         k = self._num_factors
-        for i in range(k):
-            if dtype == torch.float64:
-                m = self._mats64[i].to(x.device)
-            else:
-                m = getattr(self, f"factor{i}").to(dtype)
-            # Contract axis i of the factor grid with m: together this computes x @ kron(m_0, ..., m_{k-1}).
-            y = torch.movedim(torch.movedim(y, -k + i, -1) @ m, -1, -k + i)
+        with autocast_disabled(x.device.type):
+            y = x.to(dtype)
+            if self.random_signs:
+                y = y * buffer("signs")
+            y = y.reshape(*lead, *self.factor_sizes)
+            for i in range(k):
+                # Contract axis i of the factor grid: together this computes x @ kron(m_0, ..., m_{k-1}).
+                y = torch.movedim(torch.movedim(y, -k + i, -1) @ buffer(f"factor{i}"), -1, -k + i)
         return y.reshape(*lead, self.n).to(x.dtype)
 
+    @torch.no_grad()
+    def matrix(self) -> Tensor:
+        """The dense float64 rotation R (``forward(x) == x @ R``). For tests and reference."""
+        return self(torch.eye(self.n, dtype=torch.float64))
+
     def extra_repr(self) -> str:
-        return f"n={self.n}, factors={self.factor_sizes}, exact={self.exact}"
+        return f"n={self.n}, factors={self.factor_sizes}, exact={self.exact}, random_signs={self.random_signs}"

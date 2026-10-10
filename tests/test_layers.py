@@ -177,10 +177,13 @@ def test_hbitlinear_from_linear_preserves_function_before_quantization():
 
 
 @pytest.mark.parametrize("width", [64, 192, 768])
-def test_hbitlinear_matches_explicit_hadamard_then_reference(width):
+@pytest.mark.parametrize("signs", [True, False])
+def test_hbitlinear_matches_explicit_hadamard_then_reference(width, signs):
     torch.manual_seed(0)
-    layer = _random_layer(HBitLinear, d_in=width, d_out=24)
-    h = hadamard_matrix(width)
+    layer = _random_layer(HBitLinear, d_in=width, d_out=24, random_signs=signs)
+    h = layer.hadamard.matrix()
+    if not signs:
+        torch.testing.assert_close(h, hadamard_matrix(width))
     x = torch.randn(3, 5, width, dtype=torch.float64)
     xn = reference.rms_norm(x, layer.norm.weight.detach()) @ h
     xq = reference.activation_quant(xn)
@@ -209,3 +212,19 @@ def test_invalid_layer_arguments():
         BitLinear(8, 8, act_bits=1)
     with pytest.raises(ValueError):
         BitLinear(8, 8, weight_granularity="group")
+
+
+def test_deadzone_term_adds_row_sums_of_zero_coded_weights():
+    torch.manual_seed(0)
+    layer = BitLinear(64, 16, bias=False, deadzone_lambda=1e-2).double()
+    plain = BitLinear(64, 16, bias=False).double()
+    plain.load_state_dict(layer.state_dict())
+    x = torch.randn(5, 64, dtype=torch.float64)
+    codes, _ = layer.ternary_weight()
+    dead = (codes == 0).double()
+    expected_extra = 1e-2 * (layer.weight.detach() * dead).sum(1)
+    torch.testing.assert_close(layer(x) - plain(x), expected_extra.expand(5, -1))
+    # dead weights get an extra direct gradient of lambda * sum(dL/dy) over tokens
+    layer(x).sum().backward()
+    plain(x).sum().backward()
+    torch.testing.assert_close(layer.weight.grad - plain.weight.grad, 1e-2 * 5 * dead)

@@ -38,13 +38,14 @@ def test_pack_rejects_non_ternary():
         pack_ternary(torch.tensor([[2]]))
 
 
-@pytest.mark.parametrize("cls,granularity,act_bits", [
-    (BitLinear, "tensor", 8), (BitLinear, "channel", 8), (HBitLinear, "tensor", 8), (HBitLinear, "tensor", 4),
-    (BitLinear, "tensor", None),
+@pytest.mark.parametrize("cls,granularity,act_bits,extra", [
+    (BitLinear, "tensor", 8, {}), (BitLinear, "channel", 8, {}), (HBitLinear, "tensor", 8, {}),
+    (HBitLinear, "tensor", 4, {}), (HBitLinear, "tensor", 8, {"random_signs": False}), (BitLinear, "tensor", None, {}),
+    (BitLinear, "tensor", 8, {"deadzone_lambda": 1e-2}),
 ])
-def test_inference_layer_equals_training_layer_in_float64(cls, granularity, act_bits):
+def test_inference_layer_equals_training_layer_in_float64(cls, granularity, act_bits, extra):
     torch.manual_seed(0)
-    layer = cls(192, 50, bias=True, weight_granularity=granularity, act_bits=act_bits).double()
+    layer = cls(192, 50, bias=True, weight_granularity=granularity, act_bits=act_bits, **extra).double()
     with torch.no_grad():
         layer.bias.normal_()
     inf = BitLinearInference.from_bitlinear(layer)
@@ -55,11 +56,11 @@ def test_inference_layer_equals_training_layer_in_float64(cls, granularity, act_
 def test_inference_float32_close_to_training_layer():
     torch.manual_seed(0)
     layer = BitLinear(768, 3072)
-    inf = BitLinearInference.from_bitlinear(layer, cache_unpacked=True)
+    inf = BitLinearInference.from_bitlinear(layer, keep_unpacked=True)
     x = torch.randn(64, 768)
     y, y_ref = inf(x), layer(x)
     assert (y - y_ref).abs().max() < 1e-3 * y_ref.abs().max()
-    inf(x)  # second call uses the cached unpacked weights
+    inf(x)  # second call reuses the unpacked int8 weights
 
 
 def test_cannot_export_partially_quantized_layer():
@@ -97,3 +98,43 @@ def test_packed_model_equals_training_model_in_float64():
     x = torch.randn(2, 3, 32, 32, dtype=torch.float64)
     with torch.no_grad():
         torch.testing.assert_close(packed(x), model(x), rtol=1e-8, atol=1e-8)
+
+
+def test_weight_scale_is_a_mean_abs_multiplier():
+    torch.manual_seed(0)
+    layer = BitLinear(64, 32)
+    inf = BitLinearInference.from_bitlinear(layer)
+    torch.testing.assert_close(inf.weight_scale, layer.weight.detach().abs().mean().reshape(1))
+    codes = unpack_ternary(inf.weight_packed, 32, torch.float32)
+    torch.testing.assert_close(codes * inf.weight_scale, layer.ternary_weight()[0].float() / layer.ternary_weight()[1])
+
+
+def test_deadzone_without_bias_is_folded_into_a_new_bias():
+    torch.manual_seed(0)
+    layer = BitLinear(64, 16, bias=False, deadzone_lambda=1e-2).double()
+    inf = BitLinearInference.from_bitlinear(layer)
+    assert inf.bias is not None
+    x = torch.randn(4, 64, dtype=torch.float64)
+    torch.testing.assert_close(inf(x), layer(x), rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("mode", ["never", "auto", "always"])
+def test_int_matmul_modes_agree(mode):
+    torch.manual_seed(0)
+    layer = BitLinear(192, 64)
+    x = torch.randn(40, 192)
+    ref = BitLinearInference.from_bitlinear(layer, int_matmul="never")(x)
+    try:
+        out = BitLinearInference.from_bitlinear(layer, int_matmul=mode, keep_unpacked=False)(x)
+    except RuntimeError:
+        pytest.skip("torch._int_mm is not available on this backend")
+    torch.testing.assert_close(out, ref)
+
+
+def test_packed_checkpoint_records_conventions(tmp_path):
+    from bitnet_vision.export import PACKED_METADATA
+
+    model = create_model("bitvit_cifar_tiny", depth=1)
+    payload = save_packed(model, str(tmp_path / "p.pt"))
+    assert payload["conventions"] == PACKED_METADATA
+    assert "multiplier" in payload["conventions"]["weight_scale"]

@@ -21,7 +21,7 @@ from .distill import distillation_loss
 from .optim import apply_schedule, build_optimizer
 from .schedule import TwoStageSchedule
 
-__all__ = ["TrainConfig", "evaluate", "ternary_stats", "train"]
+__all__ = ["TrainConfig", "evaluate", "ternary_stats", "switch_activation_bits", "train"]
 
 
 @dataclass
@@ -29,7 +29,7 @@ class TrainConfig:
     epochs: int = 30
     batch_size: int = 128
     lr: float = 1e-3
-    schedule: str = "bitnet"  # see TwoStageSchedule: bitnet, bitnet_cosine, restart, cosine, linear
+    schedule: str = "bitnet"  # see TwoStageSchedule: bitnet, bitnet_cosine, restart, wsd, cosine, linear
     split: float | None = None  # stage boundary as a fraction of training (default 0.5 bitnet, 0.9 restart)
     stage2_factor: float = 2.0 / 3.0  # bitnet: lr multiplier after the split
     restart_lr_ratio: float = 0.1  # restart: stage-2 peak lr as a fraction of lr
@@ -41,14 +41,18 @@ class TrainConfig:
     grad_clip: float | None = 1.0
     label_smoothing: float = 0.1
     augment: bool = True
-    distill_alpha: float = 1.0  # only used with a teacher; 1.0 = pure KL
+    # Only used with a teacher. 0.9 keeps a little cross-entropy as an anchor, which matters with a weak
+    # CPU-trained teacher; 1.0 is FTerViT's pure-KL recipe (it used a strong ImageNet-pretrained teacher).
+    distill_alpha: float = 0.9
     distill_temperature: float = 1.0
     # Full precision first, then ternary, in one run with one optimizer (continual QAT, arXiv 2502.11895).
     fp_fraction: float = 0.0
     quant_ramp_epochs: float = 0.0  # >0: blend quantization in gradually after the full-precision phase
-    # BitNet v2: train with 8-bit activations, switch HBitLinear inputs to 4 bits for the last ~5% of steps.
-    final_hadamard_act_bits: int | None = None
+    # BitNet v2: train with 8-bit activations, then switch to 4 bits for the last ~5% of steps, reusing the
+    # optimizer state. scope "all" switches every BitLinear (the paper's recipe); "rotated" only HBitLinear.
+    final_act_bits: int | None = None
     final_act_bits_fraction: float = 0.05
+    final_act_bits_scope: str = "all"
     amp: str | None = None  # "bf16" for bfloat16 autocast
     device: str = "cpu"
     seed: int = 0
@@ -142,8 +146,17 @@ def train(
     quantized = bool(getattr(config, "quantize", True))
     fp_steps = int(round(cfg.fp_fraction * total_steps)) if quantized else 0
     ramp_steps = int(cfg.quant_ramp_epochs * steps_per_epoch) if quantized else 0
+    if fp_steps + ramp_steps > total_steps:
+        raise ValueError(f"the full-precision phase ({fp_steps} steps) plus the quantization ramp ({ramp_steps} "
+                         f"steps) is longer than training ({total_steps} steps); the model would never be fully "
+                         "ternary")
+    if cfg.final_act_bits_scope not in ("all", "rotated"):
+        raise ValueError("final_act_bits_scope must be 'all' or 'rotated'")
     low_bit_step = (int(round((1.0 - cfg.final_act_bits_fraction) * total_steps))
-                    if cfg.final_hadamard_act_bits is not None else None)
+                    if cfg.final_act_bits is not None else None)
+    if (low_bit_step is not None and cfg.final_act_bits_scope == "rotated"
+            and not any(isinstance(m, HBitLinear) for m in model.modules())):
+        raise ValueError("final_act_bits_scope='rotated' but the model has no HBitLinear layers (use hadamard=True)")
 
     def quant_strength_at(s: int) -> float:
         if s < fp_steps:
@@ -158,6 +171,15 @@ def train(
         start_epoch, step = resume["epoch"], resume["step"]
         history = resume.get("history", history)
         gen.set_state(resume["rng"])
+        if "torch_rng" in resume:  # global generator (DropPath masks)
+            torch.set_rng_state(resume["torch_rng"])
+        if "cuda_rng" in resume and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(resume["cuda_rng"])
+        # Restore the phase the run was in (also when it had already finished).
+        if step > 0 and (fp_steps or ramp_steps):
+            set_quant_strength(model, quant_strength_at(step - 1))
+        if low_bit_step is not None and step > low_bit_step:
+            switch_activation_bits(model, cfg.final_act_bits, cfg.final_act_bits_scope)
         log(f"resumed from epoch {start_epoch}, step {step}")
 
     prev_codes = _codes_snapshot(model) if quantized else None
@@ -171,7 +193,7 @@ def train(
             if fp_steps or ramp_steps:
                 set_quant_strength(model, quant_strength_at(step))
             if low_bit_step is not None and step >= low_bit_step:
-                _switch_hadamard_act_bits(model, cfg.final_hadamard_act_bits)
+                switch_activation_bits(model, cfg.final_act_bits, cfg.final_act_bits_scope)
             if cfg.augment:
                 images = augment(images, generator=gen)
             x, y = normalize(images.to(device)), labels.to(device)
@@ -209,6 +231,10 @@ def train(
             record.update(test_acc=ev["acc"], test_loss=ev["loss"])
         if quantized:
             record["ternary"] = ternary_stats(model)
+            zero = record["ternary"]["zero"]
+            if quant_strength_at(step - 1) > 0 and not 0.1 <= zero <= 0.7:
+                log(f"warning: {zero:.0%} of ternary weights are 0 (healthy runs stay roughly between 10% and 70%; "
+                    "a drift toward 100% usually means gradient is leaking into the quantization scales)")
             codes = _codes_snapshot(model)
             changed = sum((a != b).sum().item() for a, b in zip(codes, prev_codes))
             record["code_flip_rate"] = changed / max(1, sum(c.numel() for c in codes))
@@ -221,20 +247,37 @@ def train(
         log(json.dumps({k: (round(v, 5) if isinstance(v, float) else v) for k, v in record.items()}))
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch + 1,
-                        "step": step, "rng": gen.get_state(), "history": history,
-                        "model_config": history.get("model_config")}, os.path.join(out_dir, "last.pt"))
-            with open(os.path.join(out_dir, "metrics.json"), "w") as f:
-                json.dump(history, f, indent=1)
+            state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch + 1,
+                     "step": step, "rng": gen.get_state(), "torch_rng": torch.get_rng_state(),
+                     "history": history, "model_config": history.get("model_config")}
+            if torch.cuda.is_available():
+                state["cuda_rng"] = torch.cuda.get_rng_state_all()
+            _atomic_save(lambda f, s=state: torch.save(s, f), os.path.join(out_dir, "last.pt"))
+            _atomic_save(lambda f: f.write(json.dumps(history, indent=1).encode()),
+                         os.path.join(out_dir, "metrics.json"))
     return history
 
 
-def _switch_hadamard_act_bits(model: nn.Module, bits: int) -> None:
-    """Move every HBitLinear to ``bits``-bit activations (absmean below 8 bits) and record it in the config."""
+def _atomic_save(write: Callable[[Any], Any], path: str) -> None:
+    """Write to a temporary file, then rename, so an interrupted save never leaves a truncated file."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        write(f)
+    os.replace(tmp, path)
+
+
+def switch_activation_bits(model: nn.Module, bits: int, scope: str = "all") -> None:
+    """Move BitLinear layers to ``bits``-bit activations (absmean below 8 bits) and record it in the config.
+
+    scope "all" changes every BitLinear (BitNet v2's recipe), "rotated" only the HBitLinear layers.
+    """
     method = "absmax" if bits >= 8 else "absmean"
     for m in bitlinear_modules(model):
-        if isinstance(m, HBitLinear) and (m.act_bits != bits or m.act_method != method):
+        if scope == "all" or isinstance(m, HBitLinear):
             m.act_bits, m.act_method = bits, method
     config = getattr(model, "config", None)
-    if config is not None and getattr(config, "hadamard", False):
-        config.hadamard_act_bits = bits
+    if config is not None:
+        if getattr(config, "hadamard", False):
+            config.hadamard_act_bits = bits
+        if scope == "all" and hasattr(config, "act_bits"):
+            config.act_bits = bits

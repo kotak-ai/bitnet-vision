@@ -7,13 +7,18 @@ from typing import Any
 import torch
 from torch import nn
 
-from .export import convert_for_inference
-from .layers import HBitLinear
+from .export import PACKED_METADATA, convert_for_inference
+from .layers import BitLinear, HBitLinear
 from .models.vit import BitViT, BitViTConfig
 
 __all__ = ["save_model", "load_model", "transfer_weights", "save_packed", "load_packed", "PACKED_FORMAT"]
 
 PACKED_FORMAT = "bitnet_vision.packed.v1"
+
+
+def _upgrade_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Fill in fields added after a checkpoint was written, keeping the behavior it was trained with."""
+    return {"hadamard_random_signs": False, **config}  # rotations had no random signs before the field existed
 
 
 def save_model(model: BitViT, path: str, **extra: Any) -> None:
@@ -30,24 +35,43 @@ def load_model(path: str, map_location: str | torch.device = "cpu", **config_ove
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
     if ckpt.get("format") == PACKED_FORMAT:
         raise ValueError(f"{path} is a packed inference checkpoint; use load_packed()")
-    cfg = BitViTConfig(**{**ckpt["model_config"], **config_overrides})
+    if "hadamard" in config_overrides and config_overrides["hadamard"] != ckpt["model_config"].get("hadamard"):
+        raise ValueError("changing 'hadamard' on load would scramble the weights; build the new model and use "
+                         "transfer_weights() instead")
+    cfg = BitViTConfig(**{**_upgrade_config(ckpt["model_config"]), **config_overrides})
     model = BitViT(cfg)
     model.load_state_dict(ckpt["model"])
     return model
+
+
+def _rotation(module: nn.Module) -> torch.Tensor | None:
+    return module.hadamard.matrix() if isinstance(module, HBitLinear) else None
 
 
 @torch.no_grad()
 def transfer_weights(dst: BitViT, src: BitViT) -> BitViT:
     """Copy all weights from ``src`` into ``dst`` (same architecture, any ``quantize`` setting).
 
-    If ``dst`` uses HBitLinear where ``src`` has a plain BitLinear, the copied weights are rotated
-    (``W H``) so that the layer computes the same function on its rotated input.
+    Layers whose input rotation differs (HBitLinear vs BitLinear, or different sign settings) get their
+    weights re-expressed for the new rotation, ``W_dst = W_src R_src^T R_dst``, so every layer computes the
+    same function before quantization.
     """
     dst.load_state_dict(src.state_dict())
     src_modules = dict(src.named_modules())
     for name, m in dst.named_modules():
-        if isinstance(m, HBitLinear) and not isinstance(src_modules.get(name), HBitLinear):
-            m.weight.copy_(m._weight_for_input_space(m.weight))
+        if not isinstance(m, BitLinear):
+            continue
+        r_src, r_dst = _rotation(src_modules[name]), _rotation(m)
+        if r_src is None and r_dst is None:
+            continue
+        if r_src is not None and r_dst is not None and torch.equal(r_src, r_dst):
+            continue
+        w = m.weight.double()
+        if r_src is not None:
+            w = w @ r_src.T.to(w.device)  # undo the source rotation
+        if r_dst is not None:
+            w = w @ r_dst.to(w.device)
+        m.weight.copy_(w.to(m.weight.dtype))
     return dst
 
 
@@ -56,16 +80,22 @@ def save_packed(model: nn.Module, path: str) -> dict[str, Any]:
     if not hasattr(model, "config"):
         raise TypeError("save_packed needs a BitViT (it stores the model config)")
     packed = convert_for_inference(model)  # copies; a no-op swap if the model is already packed
-    payload = {"format": PACKED_FORMAT, "model_config": model.config.to_dict(), "model": packed.state_dict()}
+    config = {**model.config.to_dict(), "quantize": True}  # a packed model is quantized by definition
+    payload = {"format": PACKED_FORMAT, "conventions": dict(PACKED_METADATA), "model_config": config,
+               "model": packed.state_dict()}
     torch.save(payload, path)
     return payload
 
 
-def load_packed(path: str, map_location: str | torch.device = "cpu") -> nn.Module:
-    """Load a packed checkpoint into a BitViT whose BitLinear layers are ``BitLinearInference``."""
+def load_packed(path: str, map_location: str | torch.device = "cpu", **inference_kwargs: Any) -> nn.Module:
+    """Load a packed checkpoint into a BitViT whose BitLinear layers are ``BitLinearInference``.
+
+    ``inference_kwargs`` (``int_matmul``, ``keep_unpacked``) are passed to every inference layer.
+    """
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
     if ckpt.get("format") != PACKED_FORMAT:
         raise ValueError(f"{path} is not a packed checkpoint ({PACKED_FORMAT})")
-    model = convert_for_inference(BitViT(BitViTConfig(**ckpt["model_config"])), inplace=True)
+    config = BitViTConfig(**{**_upgrade_config(ckpt["model_config"]), "quantize": True})
+    model = convert_for_inference(BitViT(config), inplace=True, **inference_kwargs)
     model.load_state_dict(ckpt["model"])
     return model.eval()

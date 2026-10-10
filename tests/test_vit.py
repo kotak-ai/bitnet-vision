@@ -119,3 +119,16 @@ def test_overfits_a_tiny_batch():
         loss.backward()
         opt.step()
     assert (model(x).argmax(-1) == y).float().mean() >= 0.9
+
+
+def test_seqpool_and_hadamard_sign_options():
+    model = create_model("bitvit_cifar_tiny", depth=1, pool="seqpool", hadamard=True, hadamard_random_signs=False)
+    assert model.seq_pool is not None
+    assert model.blocks[0].mlp.fc2.hadamard.random_signs is False
+    assert create_model("bitvit_cifar_tiny", depth=1, hadamard=True).blocks[0].mlp.fc2.hadamard.random_signs
+    assert model(torch.randn(2, 3, 32, 32)).shape == (2, 10)
+
+
+def test_low_bit_activations_without_hadamard_warn():
+    with pytest.warns(UserWarning, match="Hadamard"):
+        BitViTConfig(act_bits=4)
