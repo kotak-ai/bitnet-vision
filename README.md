@@ -126,6 +126,45 @@ Things worth knowing:
 * `torch.compile` works, but on PyTorch older than 2.5 a `--quant-ramp-epochs` ramp makes it recompile
   every step; compile only after the ramp or use a newer PyTorch.
 
+## Results on CIFAR-10
+
+One run of each line in `scripts/cifar_experiments.sh` with `bitvit_cifar_tiny` (1.8M parameters), on 4
+CPU threads with no GPU, at commit 7ef581c (the training code has not changed since). Per-epoch numbers
+are in [docs/cifar10_results.json](docs/cifar10_results.json).
+
+| Run | Epochs | Test accuracy | Packed 2-bit model | Weights at 0 | Saved size |
+|---|---|---|---|---|---|
+| Full precision, cosine schedule | 15 | 63.4% |  |  | 7.2 MB |
+| Full precision, BitNet schedule | 15 | 65.1% |  |  | 7.2 MB |
+| Ternary, from scratch, BitNet schedule | 15 | 67.1% | 67.1% | 32% | 0.61 MB |
+| Ternary, from the cosine full-precision model + distillation | 10 | 64.0% | 64.0% | 33% | 0.61 MB |
+
+What this shows:
+
+* **The 2-bit export is faithful.** The packed model scores the same as the model it came from (within
+  0.02 points) and is 11.8 times smaller.
+* **Training is healthy.** Each of the 24 ternary layers keeps 31 to 37% of its weights at 0 (no layer
+  collapsed toward all zeros), and the accuracy curves rise steadily.
+* **Ternary kept up with full precision on this small budget.** With the identical schedule, the ternary
+  model was ahead at every epoch from epoch 3 on and finished 2.0 points higher. It also reached a lower
+  training loss, so the lead comes from learning faster, not only from doing better on new images.
+* **The schedule matters too.** The same full-precision model scored 1.7 points higher with BitNet's
+  two-stage schedule than with a cosine schedule.
+
+What it does not show:
+
+* **These are short runs.** 15 epochs on a CPU, and every model was still improving at the end. In the
+  runs trained from scratch, accuracy on the training images never rose above accuracy on the test images
+  (training sees randomly cropped and flipped images), so all of them were far from finished. CCT reports
+  about 91% for ViTs of 3 to 4M parameters trained for 300 epochs.
+* **One seed each.** Gaps of a point or two between runs can come from the random seed alone.
+* **"Ternary beats full precision" is not the general rule.** Published results have ternary ViTs a few
+  points behind full precision (ViT-1.58b on CIFAR-10: 72.3% vs 76.3%), so do not expect this lead to
+  hold with longer training or bigger models.
+* **Distillation was limited by its teacher.** The distilled model started from the 63.4% cosine
+  baseline, which was also its teacher, and ended 0.5 points above it. A stronger teacher (longer
+  training, or a pretrained model) is what would make this route pay off.
+
 ## Memory and speed, honestly
 
 During training `BitLinear` keeps full-precision weights and only simulates quantization, so it is a bit

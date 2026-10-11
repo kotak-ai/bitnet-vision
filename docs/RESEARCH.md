@@ -72,4 +72,5 @@ Paper numbers are arXiv ids.
 Published ternary ViT results on CIFAR-10 either fine-tune large pretrained models at 224x224 (FTerViT:
 97.43% vs 97.52% in full precision, with an ImageNet-pretrained teacher) or train weak models from scratch
 (ViT-1.58b, 2406.18051: 72.27% vs 76.28%). There is no published number for a short CPU run at 32x32, so
-this repo always trains and reports a full-precision twin of the same size under the same budget.
+this repo always trains and reports a full-precision twin of the same size under the same budget. The
+numbers from this repo's own runs are in the README, under "Results on CIFAR-10".
