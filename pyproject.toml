@@ -12,6 +12,7 @@ dependencies = ["torch>=2.2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.17,<0.18", "numpy"]
+mlx = ["mlx>=0.32", "numpy"]  # bitnet_vision.apple.mlx_ternary, which converts arrays through NumPy
 
 [project.urls]
 Repository = "https://github.com/kotak-ai/bitnet-vision"

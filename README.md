@@ -188,6 +188,33 @@ loop). Expect modest gains at best from pure PyTorch; real speedups need a kerne
 weights directly (bitnet.cpp, T-MAC, or a custom kernel). `scripts/bench.py` measures every variant and
 records the machine state, so compare numbers only from a quiet machine.
 
+## Apple Silicon (experimental)
+
+`bitnet_vision.apple` has two inference paths for Macs. Both were written and checked on Linux and have
+**not yet run on Apple hardware**; `scripts/apple_check.py` and `scripts/apple_bench.py` are the first test.
+
+* `convert_to_fused(model)` (PyTorch, MPS backend): two Metal kernels replace the dozen or so small steps
+  around each ternary layer (RMSNorm and rounding to 8 bits in one pass, rescale and bias in another). The
+  matmul itself stays a float32 `F.linear` on the integer codes, which is exact.
+* `MLXBitLinear` and `mlx_block_from_vit_block` (MLX): MLX's built-in 2-bit matmul with hand-packed weights.
+  Do not use `mx.quantize` for ternary weights: at 2 bits it turns every -1 weight into -0.5.
+
+Why fusion rather than a special ternary matmul: for models of this size every layer does far more
+arithmetic than memory traffic, and M1 to M4 GPUs have no faster 8-bit or 2-bit math and no way to skip
+zeros, so a 2-bit matmul saves memory but not time. M5-generation GPUs add hardware that changes this.
+
+On a Mac (PyTorch 2.14 or newer is required on M1 and M2 GPUs; older versions return wrong gradients for
+large matrix products):
+
+```bash
+pip install -U "torch>=2.14"
+pip install -e ".[mlx,dev]"
+python scripts/apple_check.py      # correctness on the GPU against a float64 CPU reference
+python scripts/apple_bench.py      # speed: layers, whole models, training throughput
+```
+
+Both write a JSON report to `apple_results/`. Run the benchmark plugged in, with Low Power Mode off.
+
 ## Checkpoint format
 
 `save_packed` writes `{"format": "bitnet_vision.packed.v1", "conventions": ..., "model_config": ...,
@@ -199,7 +226,7 @@ not drop-in loadable there. All checkpoints load with `torch.load(..., weights_o
 
 ## Tests
 
-`pytest` runs about 180 tests, including exact comparisons with Microsoft's reference code (forward and
+`pytest` runs about 350 tests (150 more run only on a Mac), including exact comparisons with Microsoft's reference code (forward and
 backward), float16/bfloat16 behavior, Hadamard exactness at every ViT width, export equivalence, resume
 exactness, and short end-to-end training runs. `python tools/mutation_test.py` plants 44 known bugs one at
 a time (including every bug found in the old branches) and checks that the tests catch each one.
@@ -215,7 +242,8 @@ bitnet_vision/
   checkpoint.py   save/load for training and packed checkpoints
   models/vit.py   BitViT and presets
   training/       data, schedules, optimizer groups, distillation, training loop
-scripts/          train.py, eval.py, bench.py, cifar_experiments.sh
+  apple/          experimental Metal kernels (PyTorch MPS) and MLX port of the inference layer
+scripts/          train.py, eval.py, bench.py, cifar_experiments.sh, apple_check.py, apple_bench.py
 tools/            mutation_test.py
 tests/            unit and regression tests; reference.py holds Microsoft's reference code
 docs/             RESEARCH.md (papers and design choices), AUDIT.md (problems in the old branches)

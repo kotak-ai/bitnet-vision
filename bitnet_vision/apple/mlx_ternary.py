@@ -1,0 +1,412 @@
+"""MLX port of the exported ternary layer (``BitLinearInference``) and of one BitViT block.
+
+MLX is optional: nothing here imports it until a function or class that needs it is used, and the classes
+(``MLXBitLinear``, ``MLXBlock``) are built on first access.
+
+Weights. MLX's 2-bit affine format dequantizes ``w = scale * q + bias`` with codes ``q`` packed 16 per
+uint32 along the input (K) axis, least significant bits first, and one scale and bias per group of K.
+Storing ``q = code + 1`` with ``scale = g`` and ``bias = -g`` represents ``W = codes * g`` exactly.
+``mx.quantize(bits=2)`` does not: its zero-preserving rounding turns ``-g`` into ``-g / 2``.
+
+Arithmetic. ``MLXBitLinear`` computes exactly what the repo's layer computes: RMSNorm and per-token int8
+absmax quantization in float32, an integer matmul (activation codes times ternary codes, weights stored
+with unit scales), then ``/ activation_scale * weight_scale + bias`` in float32. In float32 every partial
+sum is an integer below 2^24, so the matmul is exact in any summation order and, without the RMSNorm, the
+output on MLX's CPU backend is bit-identical to ``BitLinearInference``. In float16 and bfloat16 the codes
+enter the matmul divided by 128 (exact), so its output stays far below float16's maximum (raw sums reach
+127 * K, 195,072 at K = 1536) and is rounded only once: Metal's matmul kernels accumulate in float32. MLX's
+CPU quantized matmul accumulates half precision in half precision, so judge half precision on the GPU.
+"""
+
+from __future__ import annotations
+
+import functools
+import math
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+import torch
+from torch import Tensor, nn
+
+from ..export import BitLinearInference, convert_for_inference, unpack_ternary
+from ..layers import BitLinear
+
+if TYPE_CHECKING:
+    import mlx.core as mx
+    import numpy as np
+
+__all__ = [
+    "GROUP_SIZES",
+    "pack_ternary_mlx",
+    "from_packed_repo",
+    "mlx_block_from_vit_block",
+    "compiled",
+    "to_mx",
+    "to_torch",
+]
+
+GROUP_SIZES = (32, 64, 128)
+_LAZY_CLASSES = ("MLXBitLinear", "MLXBlock")  # built on first access; left out of __all__ so * never needs MLX
+# Activation codes enter the matmul divided by 128 in half precision (exact; see the module docstring).
+_HALF_PRESCALE = 1.0 / 128.0
+
+
+def _mlx() -> tuple[Any, Any]:
+    try:
+        import mlx.core as mx
+        import mlx.nn as mnn
+        import numpy  # noqa: F401  (arrays move between torch and MLX through NumPy; neither package requires it)
+    except ImportError as err:
+        raise ImportError("bitnet_vision.apple.mlx_ternary needs MLX and NumPy (pip install mlx numpy)") from err
+    return mx, mnn
+
+
+def _mx_dtype(dtype: Any) -> Any:
+    mx, _ = _mlx()
+    if isinstance(dtype, str):
+        if dtype not in ("float32", "float16", "bfloat16"):
+            raise ValueError(f"dtype must be 'float32', 'float16' or 'bfloat16', got {dtype!r}")
+        return getattr(mx, dtype)
+    if dtype not in (mx.float32, mx.float16, mx.bfloat16):
+        raise ValueError(f"dtype must be float32, float16 or bfloat16, got {dtype}")
+    return dtype
+
+
+def _numpy(x: Any) -> np.ndarray:
+    mx, _ = _mlx()  # first, so a missing NumPy gets the install hint
+    import numpy as np
+
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+        return (x.float() if x.dtype == torch.bfloat16 else x).numpy()
+    if isinstance(x, mx.array):
+        return np.array(x.astype(mx.float32) if x.dtype == mx.bfloat16 else x)
+    return np.asarray(x)
+
+
+def to_mx(x: Any, dtype: Any = None) -> mx.array:
+    """Convert a torch tensor (any device), numpy array or MLX array to an MLX array, optionally cast."""
+    mx, _ = _mlx()
+    if isinstance(x, mx.array):
+        out = x
+    elif torch.is_tensor(x) and x.dtype == torch.bfloat16:
+        out = mx.array(_numpy(x)).astype(mx.bfloat16)
+    else:
+        out = mx.array(_numpy(x))
+    return out if dtype is None else out.astype(getattr(mx, dtype) if isinstance(dtype, str) else dtype)
+
+
+def to_torch(x: Any, dtype: torch.dtype | None = None) -> Tensor:
+    """Convert an MLX array to a CPU torch tensor (bfloat16 stays bfloat16), optionally cast."""
+    mx, _ = _mlx()
+    out = torch.from_numpy(_numpy(x))
+    if isinstance(x, mx.array) and x.dtype == mx.bfloat16:
+        out = out.to(torch.bfloat16)
+    return out if dtype is None else out.to(dtype)
+
+
+def _row_scales(weight_scale: Any, rows: int) -> np.ndarray:
+    import numpy as np
+
+    s = np.asarray(_numpy(weight_scale), dtype=np.float32).reshape(-1)
+    if s.size == 1:
+        return np.full(rows, s[0], dtype=np.float32)
+    if s.size != rows:
+        raise ValueError(f"weight_scale must be a scalar or have one value per row ({rows}), got {s.size} values")
+    return s
+
+
+def pack_ternary_mlx(
+    codes: Any, weight_scale: Any, group_size: int = 64, dtype: Any = "float32"
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Pack ternary ``codes`` [N, K] into MLX 2-bit affine arrays ``(w_q, scales, biases)``.
+
+    ``weight_scale`` is the repo's multiplier (a scalar, or one value per row), so ``W = codes * weight_scale``.
+    The result represents W exactly (``scales`` and ``biases`` are rounded to ``dtype``) for
+    ``mx.quantized_matmul(x, w_q, scales, biases, transpose=True, group_size=group_size, bits=2)``:
+    ``w_q`` is uint32 [N, K / 16] holding ``code + 1`` in 2 bits each, least significant bits first along K;
+    ``scales`` is ``weight_scale`` and ``biases`` is ``-weight_scale``, both [N, K / group_size].
+    """
+    mx, _ = _mlx()
+    import numpy as np
+
+    c = _numpy(codes)
+    if c.ndim != 2:
+        raise ValueError(f"codes must have shape [out_features, in_features], got {c.shape}")
+    rows, k = c.shape
+    if group_size not in GROUP_SIZES:
+        raise ValueError(f"group_size must be one of {GROUP_SIZES}, got {group_size}")
+    if k % group_size:
+        valid = [g for g in GROUP_SIZES if k % g == 0]
+        raise ValueError(f"in_features={k} is not a multiple of group_size={group_size} (valid: {valid})")
+    if not np.isin(c, (-1, 0, 1)).all():  # also rejects NaN and non-integer floats
+        raise ValueError("codes must hold only -1, 0 and 1")
+    q = (c.astype(np.int64) + 1).astype(np.uint32).reshape(rows, k // 16, 16)
+    w_q = np.bitwise_or.reduce(q << np.arange(0, 32, 2, dtype=np.uint32), axis=-1)
+    scales = np.repeat(_row_scales(weight_scale, rows)[:, None], k // group_size, axis=1)
+    dt = _mx_dtype(dtype)
+    return mx.array(w_q), mx.array(scales).astype(dt), mx.array(-scales).astype(dt)
+
+
+def from_packed_repo(
+    weight_packed: Any, out_features: int, weight_scale: Any, group_size: int = 64, dtype: Any = "float32"
+) -> tuple[mx.array, mx.array, mx.array]:
+    """:func:`pack_ternary_mlx` starting from the repo's packed uint8 layout (``BitLinearInference.weight_packed``)."""
+    codes = unpack_ternary(torch.as_tensor(_numpy(weight_packed)), out_features)
+    return pack_ternary_mlx(codes, weight_scale, group_size=group_size, dtype=dtype)
+
+
+def compiled(fn: Callable, **kwargs: Any) -> Callable:
+    """``mx.compile(fn, **kwargs)``: fuses the elementwise steps around each matmul into a few kernels.
+
+    Arrays the function captures (a module's weights) are traced as constants. ``shapeless=True`` is unsafe
+    for :class:`MLXBlock`, whose head split reads the input shape.
+    """
+    mx, _ = _mlx()
+    return mx.compile(fn, **kwargs)
+
+
+def _check_supported(layer: BitLinearInference) -> None:
+    if layer.hadamard is not None:
+        raise NotImplementedError("MLXBitLinear does not support Hadamard-rotated layers (HBitLinear)")
+    if layer.act_bits != 8 or layer.act_method != "absmax":
+        raise NotImplementedError(
+            f"MLXBitLinear supports only 8-bit absmax activations, got act_bits={layer.act_bits}, "
+            f"act_method={layer.act_method!r}"
+        )
+
+
+def _as_inference_layer(layer: nn.Module) -> BitLinearInference:
+    if isinstance(layer, BitLinear):
+        layer = convert_for_inference(layer)
+    if not isinstance(layer, BitLinearInference):
+        raise TypeError(f"expected a BitLinearInference (or BitLinear) layer, got {type(layer).__name__}")
+    return layer
+
+
+@functools.cache
+def _classes() -> dict[str, type]:
+    mx, mnn = _mlx()
+
+    class MLXBitLinear(mnn.Module):
+        """MLX version of ``BitLinearInference`` (8-bit absmax activations, no Hadamard rotation).
+
+        Build it with :meth:`from_inference`. The constructor takes either packed unit-scale ternary weights
+        (``w_q``, ``scales``, ``biases``, ``group_size`` as from ``pack_ternary_mlx(codes, 1.0)``) or a dense
+        ``weight`` holding the codes, plus the repo's float32 ``weight_scale``, ``bias`` and RMSNorm settings.
+        The dense variant runs a plain matmul instead of ``mx.quantized_matmul``; in float32 both are exact
+        and give identical results. ``dtype`` is the matmul dtype; norm, quantization and the rescale run in
+        float32, and the output has the input's dtype.
+        """
+
+        def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            *,
+            weight_scale: Any,
+            bias: Any = None,
+            norm: bool = True,
+            norm_weight: Any = None,
+            norm_eps: float = 1e-6,
+            w_q: mx.array | None = None,
+            scales: mx.array | None = None,
+            biases: mx.array | None = None,
+            group_size: int | None = None,
+            weight: mx.array | None = None,
+            dtype: Any = "float32",
+        ) -> None:
+            super().__init__()
+            if (weight is None) == (w_q is None):
+                raise ValueError("pass either packed weights (w_q, scales, biases) or a dense weight")
+            self.in_features = int(in_features)
+            self.out_features = int(out_features)
+            self.compute_dtype = _mx_dtype(dtype)
+            self.packed = w_q is not None
+            self.group_size = group_size
+            self.w_q, self.scales, self.biases = w_q, scales, biases
+            self.weight = weight
+            self.weight_scale = to_mx(weight_scale, mx.float32)
+            self.bias = None if bias is None else to_mx(bias, mx.float32)
+            self.norm = bool(norm)
+            self.norm_weight = None if norm_weight is None else to_mx(norm_weight, mx.float32)
+            self.norm_eps = float(norm_eps)
+            self.freeze()
+
+        @classmethod
+        def from_inference(
+            cls, layer: BitLinearInference, group_size: int = 64, dtype: Any = "float32", dense: bool = False
+        ) -> MLXBitLinear:
+            """Build from the repo's exported layer (a training ``BitLinear`` is exported first)."""
+            layer = _as_inference_layer(layer)
+            _check_supported(layer)
+            dt = _mx_dtype(dtype)
+            n, k = layer.out_features, layer.in_features
+            if dense:
+                codes = unpack_ternary(layer.weight_packed.cpu(), n)
+                weights: dict[str, Any] = {"weight": to_mx(codes).astype(dt)}
+            else:
+                w_q, scales, biases = from_packed_repo(layer.weight_packed, n, 1.0, group_size=group_size, dtype=dt)
+                weights = {"w_q": w_q, "scales": scales, "biases": biases, "group_size": group_size}
+            norm = layer.norm
+            return cls(
+                k,
+                n,
+                weight_scale=to_mx(layer.weight_scale.float()),
+                bias=None if layer.bias is None else to_mx(layer.bias.float()),
+                norm=norm is not None,
+                norm_weight=None if norm is None or norm.weight is None else to_mx(norm.weight.float()),
+                norm_eps=norm.eps if norm is not None else 1e-6,
+                dtype=dt,
+                **weights,
+            )
+
+        def quantize_input(self, x: mx.array) -> tuple[mx.array, mx.array]:
+            """``(codes, scale)`` as in ``quantize_activations``: float32 codes in [-128, 127], ``x ~= codes / scale``.
+
+            ``mx.round`` rounds half to even, like ``torch.round``.
+            """
+            x = x.astype(mx.float32)
+            if self.norm:
+                x = mx.fast.rms_norm(x, self.norm_weight, self.norm_eps)  # x * rsqrt(mean(x^2) + eps) * weight
+            # 127 * (1 / absmax), not 127 / absmax: torch evaluates ``127 / tensor`` that way
+            scale = mx.reciprocal(mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5)) * 127.0
+            return mx.clip(mx.round(x * scale), -128, 127), scale
+
+        def __call__(self, x: mx.array) -> mx.array:
+            out_dtype = x.dtype
+            codes, x_scale = self.quantize_input(x)
+            half = self.compute_dtype != mx.float32
+            a = (codes * _HALF_PRESCALE if half else codes).astype(self.compute_dtype)
+            if self.packed:
+                acc = mx.quantized_matmul(
+                    a, self.w_q, self.scales, self.biases, transpose=True, group_size=self.group_size, bits=2
+                )
+            else:
+                acc = a @ self.weight.T
+            acc = acc.astype(mx.float32)
+            if half:
+                acc = acc * (1.0 / _HALF_PRESCALE)  # exact: back to the integer sums
+            y = acc / x_scale * self.weight_scale  # same operation order as BitLinearInference
+            if self.bias is not None:
+                y = y + self.bias
+            return y.astype(out_dtype)
+
+        def _extra_repr(self) -> str:
+            kind = f"packed 2-bit, group_size={self.group_size}" if self.packed else "dense"
+            return (
+                f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, "
+                f"norm={self.norm}, {kind}, dtype={self.compute_dtype}"
+            )
+
+    class MLXBlock(mnn.Module):
+        """MLX version of ``bitnet_vision.models.vit.Block`` at inference (no DropPath). Input (B, N, C).
+
+        Build it with :func:`mlx_block_from_vit_block`.
+        """
+
+        def __init__(
+            self,
+            *,
+            num_heads: int,
+            qkv: MLXBitLinear,
+            proj: MLXBitLinear,
+            fc1: MLXBitLinear,
+            fc2: MLXBitLinear,
+            mlp_act: str = "gelu",
+            norm1: tuple[mx.array | None, mx.array | None, float] | None = None,
+            norm2: tuple[mx.array | None, mx.array | None, float] | None = None,
+            ls1: mx.array | None = None,
+            ls2: mx.array | None = None,
+        ) -> None:
+            super().__init__()
+            if mlp_act not in ("gelu", "relu2"):
+                raise ValueError(f"mlp_act must be 'gelu' or 'relu2', got {mlp_act!r}")
+            self.num_heads = int(num_heads)
+            self.qkv, self.proj, self.fc1, self.fc2 = qkv, proj, fc1, fc2
+            self.mlp_act = mlp_act
+            self.norm1_weight, self.norm1_bias, self.norm1_eps = norm1 if norm1 is not None else (None, None, None)
+            self.norm2_weight, self.norm2_bias, self.norm2_eps = norm2 if norm2 is not None else (None, None, None)
+            self.ls1, self.ls2 = ls1, ls2
+            self.freeze()
+
+        def _attention(self, x: mx.array) -> mx.array:
+            b, n, c = x.shape
+            hd = c // self.num_heads
+            qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, hd).transpose(2, 0, 3, 1, 4)
+            out = mx.fast.scaled_dot_product_attention(qkv[0], qkv[1], qkv[2], scale=1.0 / math.sqrt(hd))
+            return self.proj(out.transpose(0, 2, 1, 3).reshape(b, n, c))
+
+        def _mlp(self, x: mx.array) -> mx.array:
+            x = self.fc1(x)
+            x = mnn.gelu(x) if self.mlp_act == "gelu" else mx.square(mx.maximum(x, 0))  # gelu: erf form
+            return self.fc2(x)
+
+        def __call__(self, x: mx.array) -> mx.array:
+            h = x
+            if self.norm1_eps is not None:
+                h = mx.fast.layer_norm(h, self.norm1_weight, self.norm1_bias, self.norm1_eps)
+            h = self._attention(h)
+            x = x + (h * self.ls1 if self.ls1 is not None else h)
+            h = x
+            if self.norm2_eps is not None:
+                h = mx.fast.layer_norm(h, self.norm2_weight, self.norm2_bias, self.norm2_eps)
+            h = self._mlp(h)
+            return x + (h * self.ls2 if self.ls2 is not None else h)
+
+    for cls in (MLXBitLinear, MLXBlock):
+        cls.__qualname__ = cls.__name__
+    return {"MLXBitLinear": MLXBitLinear, "MLXBlock": MLXBlock}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_CLASSES:
+        return _classes()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_CLASSES))
+
+
+def _layer_norm_params(norm: nn.Module, dtype: Any) -> tuple[mx.array | None, mx.array | None, float] | None:
+    if isinstance(norm, nn.Identity):
+        return None
+    if not isinstance(norm, nn.LayerNorm):
+        raise NotImplementedError(f"unsupported block norm {type(norm).__name__}")
+    if len(norm.normalized_shape) != 1:
+        raise NotImplementedError("only LayerNorm over the last dimension is supported")
+    weight = None if norm.weight is None else to_mx(norm.weight.float()).astype(dtype)
+    bias = None if norm.bias is None else to_mx(norm.bias.float()).astype(dtype)
+    return weight, bias, float(norm.eps)
+
+
+def _layer_scale(ls: nn.Module, dtype: Any) -> mx.array | None:
+    if isinstance(ls, nn.Identity):
+        return None
+    return to_mx(ls.gamma.detach().float()).astype(dtype)
+
+
+def mlx_block_from_vit_block(
+    block: nn.Module, group_size: int = 64, dtype: Any = "float32", dense: bool = False
+) -> Any:
+    """MLX version of one ``bitnet_vision.models.vit.Block``: an :class:`MLXBlock` to call on (B, N, C) arrays.
+
+    Pass the block after ``convert_for_inference`` (training BitLinear layers are exported on the fly). Each
+    linear layer becomes an :class:`MLXBitLinear`; LayerNorm, softmax attention and GELU run in ``dtype``.
+    """
+    dt = _mx_dtype(dtype)
+    linear = functools.partial(_classes()["MLXBitLinear"].from_inference, group_size=group_size, dtype=dt, dense=dense)
+    attn, mlp = block.attn, block.mlp
+    return _classes()["MLXBlock"](
+        num_heads=attn.num_heads,
+        qkv=linear(attn.qkv),
+        proj=linear(attn.proj),
+        fc1=linear(mlp.fc1),
+        fc2=linear(mlp.fc2),
+        mlp_act=mlp.act,
+        norm1=_layer_norm_params(block.norm1, dt),
+        norm2=_layer_norm_params(block.norm2, dt),
+        ls1=_layer_scale(block.ls1, dt),
+        ls2=_layer_scale(block.ls2, dt),
+    )
