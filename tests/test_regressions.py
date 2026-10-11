@@ -9,7 +9,7 @@ from torch import nn
 
 from bitnet_vision.checkpoint import load_model, load_packed, save_model, save_packed, transfer_weights
 from bitnet_vision.export import BitLinearInference, convert_for_inference, pack_ternary, unpack_ternary
-from bitnet_vision.hadamard import HadamardTransform
+from bitnet_vision.hadamard import HadamardTransform, autocast_disabled
 from bitnet_vision.layers import BitLinear, HBitLinear, convert_linear_layers, set_quant_strength
 from bitnet_vision.models import create_model
 from bitnet_vision.quant import fake_quant_activations
@@ -99,6 +99,15 @@ def test_packed_float_path_ignores_autocast():
     with torch.autocast("cpu", dtype=torch.bfloat16):
         y = inf(x)
     torch.testing.assert_close(y, inf(x))
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "mps", "xpu", "meta"])
+def test_autocast_is_disabled_on_every_device_that_has_it(device_type):
+    # On a Mac the packed model's exact integer matmul must not run in float16 under autocast: sums of
+    # 1536 int8 codes overflow it. PyTorch only autocasts "mps" from 2.5; older versions have nothing to undo.
+    available = getattr(torch.amp, "is_autocast_available", None)  # PyTorch 2.4+; 2.2 autocasts cpu and cuda
+    expected = available(device_type) if available else device_type == "cpu"
+    assert isinstance(autocast_disabled(device_type), torch.autocast) == expected
 
 
 # ---------------------------------------------------------------- core math

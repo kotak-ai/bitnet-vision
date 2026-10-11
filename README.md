@@ -201,7 +201,7 @@ not drop-in loadable there. All checkpoints load with `torch.load(..., weights_o
 
 `pytest` runs about 180 tests, including exact comparisons with Microsoft's reference code (forward and
 backward), float16/bfloat16 behavior, Hadamard exactness at every ViT width, export equivalence, resume
-exactness, and short end-to-end training runs. `python tools/mutation_test.py` plants 43 known bugs one at
+exactness, and short end-to-end training runs. `python tools/mutation_test.py` plants 44 known bugs one at
 a time (including every bug found in the old branches) and checks that the tests catch each one.
 
 ## Layout

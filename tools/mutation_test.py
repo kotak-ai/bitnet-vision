@@ -62,6 +62,11 @@ MUTANTS = [
      "mats = [_factor_matrix(f) / math.sqrt(f) for f in factors]", "mats = [_factor_matrix(f) for f in factors]"),
     ("hadamard_bf16_under_autocast", "bitnet_vision/hadamard.py", "        with autocast_disabled(x.device.type):\n",
      "        with contextlib.nullcontext():\n"),
+    ("autocast_skips_mps", "bitnet_vision/hadamard.py",
+     "    try:\n        return torch.autocast(device_type=device_type, enabled=False)\n",
+     "    try:\n        if device_type in (\"cpu\", \"cuda\", \"xpu\"):\n"
+     "            return torch.autocast(device_type=device_type, enabled=False)\n"
+     "        return contextlib.nullcontext()\n"),
     ("no_random_signs", "bitnet_vision/layers.py",
      "HadamardTransform(in_features, random_signs=random_signs)", "HadamardTransform(in_features)"),
     ("partial_strength_is_hard_switch", "bitnet_vision/layers.py", "        if lam > 0:\n            if self.act_bits",

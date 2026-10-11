@@ -137,10 +137,15 @@ def hadamard_matrix(n: int, dtype: torch.dtype = torch.float64) -> Tensor:
 
 
 def autocast_disabled(device_type: str):
-    """Context manager that turns autocast off on devices that support it (no-op elsewhere, e.g. meta)."""
-    if device_type in ("cpu", "cuda", "xpu"):
+    """Context manager that turns autocast off on devices that support it (no-op elsewhere, e.g. meta).
+
+    Covers every device type the installed PyTorch can autocast, including Apple's "mps" (PyTorch 2.5+),
+    so exact integer and float32 paths are never silently run in float16 on a Mac.
+    """
+    try:
         return torch.autocast(device_type=device_type, enabled=False)
-    return contextlib.nullcontext()
+    except (RuntimeError, AttributeError):  # no autocast for this device type in this PyTorch version
+        return contextlib.nullcontext()
 
 
 def fixed_random_signs(n: int, seed: int = 0) -> Tensor:
