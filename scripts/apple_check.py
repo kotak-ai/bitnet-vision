@@ -19,10 +19,11 @@ Every item compares the device, in float32, with a float64 reference on the CPU 
   passes within 10 times that (plus 1e-3). This catches broken kernels, not small biases.
 
 Items: 1 torch version and device, 2 BitLinear and HBitLinear forward and backward, 3 matmul gradients that reduce
-over more than 32768 rows (pytorch#177116, M1/M2 GPUs), 4 forward-mode AD (torch.func.jvp) through attention and
-an iMF-style step, 5 the packed model (convert_for_inference) and autocast, 6 the fused Metal kernels, 7 MLX, 8 one
-training step of a T/4-sized BitViT. Each row reports ok, FAILED (with the error) or skipped (with the reason). The
-table is printed and everything, with the machine's details, goes to apple_results/apple_check-<time>.json.
+over more than 32768 rows (pytorch#177116, M1/M2 GPUs), 4 forward-mode AD (torch.func.jvp) through attention and an
+iMF-style step, 5 the packed model (convert_for_inference) and autocast, 6 the fused Metal kernels, 7 MLX, 8 one
+training step of a T/4-sized BitViT. Items 5, 6 and 8 also run with LoRA adapters (bitnet_vision.lora). Each row
+reports ok, FAILED (with the error) or skipped (with the reason). The table is printed and everything, with the
+machine's details, goes to apple_results/apple_check-<time>.json.
 
 Shapes: TernFlow's T/4 (width 192, MLP 768, 74 tokens per image) and S/2 (384, 1536, 266 tokens). The BitViT
 stand-ins built with create_model have 65 and 257 tokens per 32x32 image.
@@ -64,6 +65,7 @@ from bitnet_vision.apple import mps_kernels  # noqa: E402
 from bitnet_vision.apple.mps_kernels import convert_to_fused, fused_front_end, metal_available  # noqa: E402
 from bitnet_vision.export import BitLinearInference, convert_for_inference, unpack_ternary  # noqa: E402
 from bitnet_vision.layers import BitLinear, HBitLinear, RMSNorm, bitlinear_modules, set_quant_strength  # noqa: E402
+from bitnet_vision.lora import add_lora, mark_only_lora_trainable, set_lora_strength  # noqa: E402
 from bitnet_vision.models import BitViT, create_model  # noqa: E402
 from bitnet_vision.models.vit import Attention, BitViTConfig, Block  # noqa: E402
 from bitnet_vision.quant import fake_quant_weights, quantize_activations, quantize_weights  # noqa: E402
@@ -107,6 +109,18 @@ def model_config(size: str, quick: bool) -> dict[str, Any]:
 def build_model(size: str, quick: bool, **overrides: Any) -> BitViT:
     """The BitViT stand-in for TernFlow's T/4 or S/2 (random weights)."""
     return create_model("bitvit_cifar_tiny", **{**model_config(size, quick), **overrides})
+
+
+def add_lora_for_check(model: nn.Module) -> None:
+    """Two LoRA adapters (one at half strength) on every ternary layer and the head, with non-zero B."""
+    add_lora(model, r=8, targets=("qkv", "proj", "fc1", "fc2", "head"))
+    add_lora(model, r=4, name="second", targets=("fc1",))
+    set_lora_strength(model, 0.5, "second")
+    g = torch.Generator().manual_seed(6)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "lora_B" in name:
+                p.copy_(0.02 * torch.randn(p.shape, generator=g))
 
 
 def linear_shapes(quick: bool) -> list[tuple[str, int, int, int]]:
@@ -822,9 +836,11 @@ class Checks:
         return result
 
     # 5 -------------------------------------------------------------------------------------------------------
-    def _packed_model(self) -> tuple[BitViT, Tensor]:
+    def _packed_model(self, lora: bool = False) -> tuple[BitViT, Tensor]:
         torch.manual_seed(0)
         model = build_model("T/4", self.quick, hadamard=True).eval()
+        if lora:
+            add_lora_for_check(model)
         cfg = model.config
         g = torch.Generator().manual_seed(5)
         x = torch.randn(2 if self.quick else 4, 3, cfg.img_size, cfg.img_size, generator=g)
@@ -869,9 +885,9 @@ class Checks:
 
         return run
 
-    def model_logits(self, fused: bool = False) -> dict:
+    def model_logits(self, fused: bool = False, lora: bool = False) -> dict:
         need_device(self.device)
-        packed, x = self._packed_model()
+        packed, x = self._packed_model(lora)
         run = self._model_run(packed)
         device_run = None
         if fused:
@@ -1123,13 +1139,16 @@ class Checks:
         return verdict(entries, note=f"{n} tokens x 2, {close:.0%} within 1e-4 (CPU float32 {cpu_close:.0%})")
 
     # 8 -------------------------------------------------------------------------------------------------------
-    def train_step(self, quantize: bool, large: bool = False) -> dict:
+    def train_step(self, quantize: bool, large: bool = False, lora: bool = False) -> dict:
         need_device(self.device)
         cfg = model_config("T/4", self.quick)
         if large:
             cfg["depth"] = min(cfg["depth"], 2)
         torch.manual_seed(0)
         master = clear_of_weight_ties(create_model("bitvit_cifar_tiny", quantize=quantize, **cfg))
+        if lora:  # adapters only, on a frozen base
+            add_lora_for_check(master)
+            mark_only_lora_trainable(master)
         tokens_per_image = master.config.num_patches + 1
         batch = -(-32769 // tokens_per_image) if large else (2 if self.quick else 8)
         g = torch.Generator().manual_seed(7)
@@ -1139,9 +1158,9 @@ class Checks:
 
         def run(device: str, dtype: torch.dtype, x: Tensor, labels: Tensor) -> dict:
             model = copy.deepcopy(master).to(device=device, dtype=dtype).train()
-            params = dict(model.named_parameters())
+            params = {name: p for name, p in model.named_parameters() if p.requires_grad}
             before = {name: p.detach().clone() for name, p in params.items()}
-            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+            opt = torch.optim.AdamW(params.values(), lr=lr, weight_decay=0.05)
             logits = model(to(x, device, dtype))
             loss = F.cross_entropy(logits, labels.to(device))
             loss.backward()
@@ -1217,6 +1236,7 @@ def main(argv: list[str] | None = None) -> dict:
         ("5.2", "packed T/4 model: logits", c.model_logits),
         ("5.3", "packed layers under autocast: unchanged", c.autocast_layers),
         ("5.4", "packed T/4 model under autocast", c.autocast_model),
+        ("5.5", "packed T/4 model with LoRA adapters: logits", lambda: c.model_logits(lora=True)),
         ("6.1", "Metal kernels compile", c.metal_compile),
     ]
     for i, (name, k, n, m) in enumerate(shapes):
@@ -1243,6 +1263,8 @@ def main(argv: list[str] | None = None) -> dict:
         items.append((f"6.{len(shapes) + i + 2}", f"fused edge case: {name}", fn))
     items.append((f"6.{len(shapes) + len(edge) + 2}", "fused T/4 model (Hadamard): logits",
                   lambda: c.model_logits(fused=True)))
+    items.append((f"6.{len(shapes) + len(edge) + 3}", "fused T/4 model with LoRA adapters: logits",
+                  lambda: c.model_logits(fused=True, lora=True)))
     items.append(("7.1", "MLX", c.mlx_about))
     for i, (name, k, n, m) in enumerate(shapes):
         items.append((f"7.{i + 2}", f"MLXBitLinear {name} {k}->{n}, 2x{m} tokens",
@@ -1257,6 +1279,7 @@ def main(argv: list[str] | None = None) -> dict:
         ("8.1", "training step, ternary T/4", lambda: c.train_step(quantize=True)),
         ("8.2", "training step, full-precision T/4", lambda: c.train_step(quantize=False)),
         ("8.3", "training step, > 32768 token rows", lambda: c.train_step(quantize=False, large=True)),
+        ("8.4", "training step, LoRA adapters on a frozen ternary T/4", lambda: c.train_step(quantize=True, lora=True)),
     ]
     try:
         for row_id, name, fn in items:

@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from bitnet_vision.checkpoint import load_model  # noqa: E402
+from bitnet_vision.checkpoint import load_model, transfer_weights  # noqa: E402
 from bitnet_vision.export import convert_for_inference, packed_state_dict_bytes  # noqa: E402
 from bitnet_vision.models import MODEL_PRESETS, create_model  # noqa: E402
 
@@ -62,7 +62,7 @@ def main(argv=None) -> dict:
     # A full-precision checkpoint is benchmarked as its ternary twin (latency does not depend on the values).
     tern = load_model(a.checkpoint, quantize=True).eval() if a.checkpoint else create_model(a.model).eval()
     fp = create_model(a.model, **{**tern.config.to_dict(), "quantize": False}).eval()
-    fp.load_state_dict(tern.state_dict())  # same weights, quantization off
+    transfer_weights(fp, tern)  # same weights (and LoRA adapters, if any), quantization off
     variants = {
         "fp32": fp,
         "ternary_training_mode": tern,

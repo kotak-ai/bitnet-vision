@@ -57,6 +57,16 @@ Paper numbers are arXiv ids.
 | noted | Real speedups need kernels that read packed weights (bitnet.cpp 2502.11880, T-MAC, Litespark 2605.06485); at ViT-Tiny sizes the activation quantization costs more than the matmul itself, so it must be fused | RobuQ (2509.23582, Table 9) |
 | noted | Other formats: bitnet.cpp's I2_S (128-weight blocks, x86), base-3 packing at 1.6 bits per weight, sparse ternary formats | bitnet.cpp, BITCOS (2609.16338), Sherry (2601.07892) |
 
+## LoRA adapters
+
+| Use | Idea | Source |
+|---|---|---|
+| built in | A low-rank side branch `y + (alpha / r) * B A x`, A Kaiming-uniform and B zero, so a new adapter changes nothing | LoRA (Hu et al., 2106.09685), with PEFT's initialization |
+| built in | Adapters stay in full precision on a frozen low-bit base | QLoRA (2305.14314) keeps 16-bit adapters on a 4-bit base |
+| built in | The branch reads the layer's raw input and is added after the bias, so BitLinear's inner norm and rotation do not touch it | PEFT's LoRA layer wraps any `nn.Linear` subclass, BitLinear included, exactly this way; with PEFT 0.21.2 installed, `tests/test_lora.py` checks that both libraries give identical outputs from each other's files |
+| option | rsLoRA scale `alpha / sqrt(r)` (`use_rslora=True`) | Kalajdzievski (2312.03732) |
+| left out | DoRA, trained biases (`bias != "none"`, `lora_bias`), and merging adapters into ternary layers that normalize their input inside (no weight change reproduces a branch on the raw input there) | |
+
 ## Ideas looked at and left out
 
 * ParetoQ's learned "SEQ" ternary quantizer: zeros 70 to 80% of weights at the start and scored far below

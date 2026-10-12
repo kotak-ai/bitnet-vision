@@ -16,6 +16,7 @@ import torch
 
 from bitnet_vision import BitLinear, HBitLinear, convert_for_inference, pack_ternary
 from bitnet_vision.apple import mlx_ternary as mt
+from bitnet_vision.lora import DEFAULT_TARGETS, add_lora, disable_lora, lora_layers, set_lora_strength
 from bitnet_vision.models.vit import BitViTConfig, Block
 from bitnet_vision.quant import quantize_activations
 
@@ -46,6 +47,21 @@ def _layer(k, n, bias=True, granularity="tensor", norm=True, seed=0):
         if norm:
             layer.norm.weight.uniform_(0.5, 1.5)
     return convert_for_inference(layer, int_matmul="never")
+
+
+def _add_adapters(model, seed=0):
+    """Two non-zero LoRA adapters on every BitLinear-family layer (one at strength -0.5) and a disabled third."""
+    for name, r in (("default", 4), ("b", 2), ("off", 2)):
+        add_lora(model, r=r, name=name, targets=DEFAULT_TARGETS if hasattr(model, "attn") else None)
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for _, m in lora_layers(model):
+            for k in m.lora_settings:
+                for w in (m.lora_A[k].weight, m.lora_B[k].weight):
+                    w.copy_(0.1 * torch.randn(w.shape, generator=g))
+    set_lora_strength(model, -0.5, "b")
+    disable_lora(model, "off")
+    return model
 
 
 def _inputs(k, seed=0):
@@ -279,6 +295,29 @@ def test_dense_and_packed_agree(mx, k, n, norm):
     assert np.array_equal(np.array(dense(x)), np.array(packed(x)))
 
 
+@pytest.mark.parametrize("k,n", SHAPES[:2])
+@pytest.mark.parametrize("dense", [False, True])
+def test_layer_with_lora_adapters_matches_inference_layer(mx, k, n, dense):
+    ref = _add_adapters(_layer(k, n, granularity="channel"))
+    m = mt.MLXBitLinear.from_inference(ref, dense=dense)
+    assert len(m.lora_A) == len(m.lora_B) == len(m.lora_scale) == 2  # the disabled adapter is left out
+    x = _inputs(k)
+    _check_layer(m, ref, x)
+    with torch.no_grad():
+        y = ref(x)
+        disable_lora(ref)
+        assert (y - ref(x)).abs().max() > 0.1 * y.abs().max()  # the adapters matter at this tolerance
+
+
+def test_training_layer_with_adapters_is_exported_on_the_fly(mx):
+    torch.manual_seed(0)
+    layer = _add_adapters(BitLinear(192, 64))
+    x = mt.to_mx(_inputs(192))
+    a = mt.MLXBitLinear.from_inference(layer)(x)
+    b = mt.MLXBitLinear.from_inference(convert_for_inference(layer))(x)
+    assert np.array_equal(np.array(a), np.array(b))
+
+
 def test_training_layer_is_exported_on_the_fly(mx):
     torch.manual_seed(0)
     layer = BitLinear(192, 64)
@@ -381,6 +420,17 @@ def test_block_matches_torch(mx, name):
     dense = mt.mlx_block_from_vit_block(block, dense=True)(mt.to_mx(x))
     assert np.array_equal(np.array(dense), np.array(y))
     _assert_block_close(mt.to_torch(mt.compiled(m)(mt.to_mx(x))), mt.to_torch(y))
+
+
+def test_block_with_lora_adapters_matches_torch(mx):
+    block = _add_adapters(_block(192, 3, layer_scale_init=0.1))
+    x = torch.randn(2, 74, 192, generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        y_ref = block(x)
+    _assert_block_close(mt.to_torch(mt.mlx_block_from_vit_block(block)(mt.to_mx(x))), y_ref)
+    disable_lora(block)
+    with torch.no_grad():
+        assert (block(x) - y_ref).abs().max() > 0.05 * y_ref.abs().max()
 
 
 def test_block_float16_smoke(mx):

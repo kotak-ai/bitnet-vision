@@ -30,6 +30,7 @@ export to packed 2-bit weights that make checkpoints 8 to 14 times smaller.
 | `BitViT` | A Vision Transformer whose qkv, projection and MLP layers are ternary. The patch embedding, position embeddings, norms and classifier head stay in full precision: quantizing those costs a lot of accuracy for very little size. |
 | Training | CIFAR-10 loader, BitNet's two-stage schedule and other schedules, distillation, "full precision first, then ternary" switching, BitNet v2's late switch to 4-bit activations, bf16 autocast, safe resumable checkpoints. |
 | Export | `convert_for_inference` stores 4 weights per byte and runs int8 activations through an integer matmul. |
+| LoRA | Small full-precision adapters on any ternary layer or `nn.Linear`, trained with the base model frozen, saved and loaded in PEFT's file format, kept through export. |
 
 Why each design choice was made, with the papers behind it: [docs/RESEARCH.md](docs/RESEARCH.md).
 What was wrong with the earlier attempts in this repo: [docs/AUDIT.md](docs/AUDIT.md).
@@ -38,7 +39,7 @@ What was wrong with the earlier attempts in this repo: [docs/AUDIT.md](docs/AUDI
 
 ```bash
 pip install torch          # any version from 2.2, CPU or CUDA
-pip install -e ".[dev]"
+pip install -e ".[dev]"    # add ,lora for safetensors adapter files: ".[dev,lora]"
 pytest -q                  # about a minute on a laptop CPU; add -m "not slow" to skip training checks
 ```
 
@@ -165,6 +166,77 @@ What it does not show:
   baseline, which was also its teacher, and ended 0.5 points above it. A stronger teacher (longer
   training, or a pretrained model) is what would make this route pay off.
 
+## LoRA adapters
+
+A LoRA adapter (low-rank adaptation, Hu et al., arXiv 2106.09685) teaches a trained model something new
+without changing it. Next to a layer it adds two small matrices, A (r x in) and B (out x r), and the layer
+then computes `layer(x) + strength * (alpha / r) * B(A(x))`. Only A and B are trained, so the adapter is a
+small file that can be added, mixed with others, switched off or removed at any time. B starts at zero, so
+a new adapter changes nothing until it is trained.
+
+Every ternary layer (training, packed and Apple versions) and every plain `nn.Linear`, such as the
+classifier head, can carry adapters. They stay in full precision next to the ternary weights:
+
+* **They are too small to be worth quantizing.** At rank 8 an adapter adds `8 * (in + out)` values to a
+  layer that holds `in * out` ternary weights. QLoRA (Dettmers et al., arXiv 2305.14314) does the same:
+  16-bit adapters on a frozen 4-bit model.
+* **Small corrections need fine steps.** Rounding A and B to -1, 0 and +1 would wipe out the small
+  adjustments an adapter learns.
+* **They see the layer's input as it arrives,** before BitLinear's own RMSNorm and Hadamard rotation, and
+  are added after the bias. That is exactly what a LoRA trained on an ordinary `nn.Linear` expects, and the
+  packed 2-bit model runs the very same branch, so exporting changes nothing.
+
+Cost: `r * (in + out)` extra multiply-adds per token in each layer with an adapter. Rank 8 on qkv, proj,
+fc1 and fc2 adds 6% to the work of the ternary layers in `bitvit_cifar_tiny` and 1.4% in
+`bitvit_base_patch16_224`. The adapter files are 0.45 MB and 4.7 MB (float32), next to packed models of
+0.66 MB and 28 MB.
+
+Train one on top of a trained model (pass the same model flags as that model's run; the base stays frozen,
+and `--lora-train-head` also trains the classifier head):
+
+```bash
+python scripts/train.py --init runs/ternary_scratch/model.pt --lora-r 8 --lr 1e-3 --schedule cosine \
+    --epochs 5 --out runs/lora
+python scripts/eval.py runs/ternary_scratch/model.pt --lora runs/lora/lora
+```
+
+`runs/lora/lora` holds the adapter in PEFT's format: `adapter_config.json` and `adapter_model.safetensors`
+(`adapter_model.bin` without the safetensors package). `model.pt` and `packed.pt` hold the whole model,
+adapter included. In Python:
+
+```python
+from bitnet_vision import add_lora, load_lora, mark_only_lora_trainable, save_lora, set_lora_strength
+from bitnet_vision.checkpoint import load_model, load_packed
+
+model = load_model("runs/ternary_scratch/model.pt")
+add_lora(model, r=8, alpha=16)          # qkv, proj, fc1 and fc2 of every block
+mark_only_lora_trainable(model)         # extra=("head",) trains the head too
+...                                     # any training loop, or bitnet_vision.training.train
+save_lora(model, "my_adapter")
+
+# Later, on the training model or the packed one; several adapters at once, each with its own strength
+model = load_packed("runs/ternary_scratch/packed.pt")
+load_lora(model, "my_adapter", name="style", strength=0.8)
+load_lora(model, "other_adapter", name="detail")
+set_lora_strength(model, 0.3, "detail")  # disable_lora, enable_lora and delete_lora work the same way
+```
+
+Things worth knowing:
+
+* **Existing LoRAs.** `load_lora` reads PEFT's files and plain state dicts, and checks every shape before
+  it changes anything. Adapters whose module names and shapes match this model's (`blocks.3.attn.qkv`,
+  `head`, ...: timm's ViT names) load directly; adapters made for other models need their keys renamed
+  first.
+* **Merging.** `merge_lora_into_weights` folds an adapter into the weights only where that is exact: plain
+  `nn.Linear` layers, and ternary layers built without the inner norm (`input_norm=False`). BitViT's
+  ternary layers normalize their input inside the layer while the adapter does not, so no change of their
+  weights reproduces it, and a merged ternary layer gets new ternary codes anyway. Keep adapters as side
+  branches; that is exact and cheap.
+* **Checkpoints** (`save_model`, `save_packed` and the training loop's `last.pt`) store the adapters and
+  load them back. Older checkpoints load as before.
+* **`torch.compile`:** add or load adapters before compiling. PyTorch 2.4 and newer notice later changes
+  of strength or on/off; PyTorch 2.2 does not (call `torch._dynamo.reset()` after such changes).
+
 ## Memory and speed, honestly
 
 During training `BitLinear` keeps full-precision weights and only simulates quantization, so it is a bit
@@ -199,6 +271,8 @@ records the machine state, so compare numbers only from a quiet machine.
 * `MLXBitLinear` and `mlx_block_from_vit_block` (MLX): MLX's built-in 2-bit matmul with hand-packed weights.
   Do not use `mx.quantize` for ternary weights: at 2 bits it turns every -1 weight into -0.5.
 
+Both run LoRA adapters as ordinary float32 matmuls next to the ternary ones.
+
 Why fusion rather than a special ternary matmul: for models of this size every layer does far more
 arithmetic than memory traffic, and M1 to M4 GPUs have no faster 8-bit or 2-bit math and no way to skip
 zeros, so a 2-bit matmul saves memory but not time. M5-generation GPUs add hardware that changes this.
@@ -222,14 +296,19 @@ Both write a JSON report to `apple_results/`. Run the benchmark plugged in, with
 in 2 bits, 4 row blocks per byte in the bit layout used by Hugging Face transformers and Microsoft's
 BitNet 2B4T checkpoint), `weight_scale` (a multiplier, `W ~= codes * weight_scale`), and `bias`, which is
 added after rescaling. Module names and the bias convention differ from transformers, so these files are
-not drop-in loadable there. All checkpoints load with `torch.load(..., weights_only=True)`.
+not drop-in loadable there. Models with LoRA adapters add a `"lora"` entry (layer name, then adapter name,
+then rank, alpha, dropout, rsLoRA, strength and on/off) and keep the adapter weights in the state dict under
+`<layer>.lora_A.<adapter>.weight` and `<layer>.lora_B.<adapter>.weight`; `save_model` does the same. All
+checkpoints load with `torch.load(..., weights_only=True)`.
 
 ## Tests
 
-`pytest` runs about 350 tests (150 more run only on a Mac), including exact comparisons with Microsoft's reference code (forward and
-backward), float16/bfloat16 behavior, Hadamard exactness at every ViT width, export equivalence, resume
-exactness, and short end-to-end training runs. `python tools/mutation_test.py` plants 44 known bugs one at
-a time (including every bug found in the old branches) and checks that the tests catch each one.
+`pytest` runs about 430 tests (150 more run only on a Mac), including exact comparisons with Microsoft's
+reference code (forward and backward), float16/bfloat16 behavior, Hadamard exactness at every ViT width,
+export equivalence, resume exactness, LoRA adapters against their formula and through export and
+checkpoints (and against the PEFT library when it is installed), and short end-to-end training runs.
+`python tools/mutation_test.py` plants 62 known bugs one at a time (including every bug found in the old
+branches) and checks that the tests catch each one.
 
 ## Layout
 
@@ -239,6 +318,7 @@ bitnet_vision/
   layers.py       RMSNorm, BitLinear, HBitLinear, helpers to convert models
   hadamard.py     exact Hadamard rotations for 2^k, 12*2^k, 20*2^k, ... widths
   export.py       2-bit packing and the inference layer
+  lora.py         LoRA adapters: the side branch, training helpers, PEFT-format files
   checkpoint.py   save/load for training and packed checkpoints
   models/vit.py   BitViT and presets
   training/       data, schedules, optimizer groups, distillation, training loop

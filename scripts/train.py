@@ -9,6 +9,8 @@ Examples:
   # ternary initialized from and distilled by the full-precision run, FTerViT-style low-lr restart at the end
   python scripts/train.py --init runs/fp/model.pt --teacher runs/fp/model.pt --schedule restart \
       --lr 2e-4 --wd 0.05 --stage2-wd 0.01 --epochs 30 --out runs/ternary_kd
+  # a rank-8 LoRA adapter on top of the frozen ternary model (written to runs/lora/lora in PEFT's format)
+  python scripts/train.py --init runs/ternary/model.pt --lora-r 8 --lr 1e-3 --epochs 5 --out runs/lora
 """
 
 from __future__ import annotations
@@ -32,6 +34,14 @@ from bitnet_vision.checkpoint import (  # noqa: E402
     upgrade_config,
 )
 from bitnet_vision.export import packed_state_dict_bytes  # noqa: E402
+from bitnet_vision.lora import (  # noqa: E402
+    DEFAULT_TARGETS,
+    add_lora,
+    add_lora_from_config,
+    lora_config,
+    mark_only_lora_trainable,
+    save_lora,
+)
 from bitnet_vision.models import MODEL_PRESETS, BitViT, BitViTConfig, create_model  # noqa: E402
 from bitnet_vision.training import TrainConfig, evaluate, load_cifar10, train  # noqa: E402
 from bitnet_vision.training.schedule import SCHEDULE_KINDS  # noqa: E402
@@ -86,6 +96,16 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--train-subset", type=int, default=None)
     p.add_argument("--test-subset", type=int, default=None)
+    p.add_argument("--lora-r", type=int, default=None,
+                   help="train only a LoRA adapter of this rank on top of --init (the base model stays frozen)")
+    p.add_argument("--lora-alpha", type=float, default=None, help="LoRA alpha (default 2 * rank)")
+    p.add_argument("--lora-targets", nargs="+", default=list(DEFAULT_TARGETS),
+                   help="module-name suffixes that get an adapter")
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--lora-rslora", action="store_true", help="scale by alpha / sqrt(rank) (rsLoRA)")
+    p.add_argument("--lora-train-head", action="store_true",
+                   help="also train the classifier head (saved with the adapter, as PEFT's modules_to_save)")
+    p.add_argument("--lora-out", default=None, help="adapter directory (default <out>/lora)")
     p.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
     p.add_argument("--log-every", type=int, default=100)
     return p.parse_args(argv)
@@ -109,7 +129,10 @@ def main(argv=None) -> dict:
 
     resume = None
     last = os.path.join(a.out, "last.pt")
-    if a.resume and os.path.exists(last):
+    resuming = a.resume and os.path.exists(last)
+    if a.lora_r is not None and not a.init and not resuming:
+        raise SystemExit("--lora-r trains an adapter for a trained model: pass that model with --init")
+    if resuming:
         resume = torch.load(last, map_location="cpu", weights_only=True)
         saved = BitViTConfig(**upgrade_config(resume["model_config"]))
         differ = config_differences(saved, model.config)
@@ -117,9 +140,27 @@ def main(argv=None) -> dict:
             raise SystemExit(f"--resume: the model flags differ from the checkpoint in {differ}; "
                              "use the original command line or a new --out directory")
         model = BitViT(saved)  # weights and the run's state are restored from last.pt by train()
+        if a.lora_r is None and resume.get("lora"):
+            add_lora_from_config(model, resume["lora"])  # adapters that came with --init
     elif a.init:
-        transfer_weights(model, load_model(a.init))
+        init = load_model(a.init)
+        if a.lora_r is not None and lora_config(init):
+            raise SystemExit(f"--lora-r: {a.init} already has LoRA adapters; delete or merge them first "
+                             "(bitnet_vision.lora), or start from its base model")
+        transfer_weights(model, init)
         print(f"initialized from {a.init}")
+    lora = None
+    if a.lora_r is not None:
+        layers = add_lora(model, r=a.lora_r, alpha=2.0 * a.lora_r if a.lora_alpha is None else a.lora_alpha,
+                          targets=a.lora_targets, dropout=a.lora_dropout, use_rslora=a.lora_rslora)
+        head = ("head",) if a.lora_train_head else ()
+        if a.lora_train_head and "head" in layers:
+            raise SystemExit("--lora-train-head trains the whole head, so leave 'head' out of --lora-targets")
+        trainable = mark_only_lora_trainable(model, extra=head)
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        lora = {"dir": a.lora_out or os.path.join(a.out, "lora"), "r": a.lora_r, "layers": len(layers),
+                "trainable_params": n_train, "modules_to_save": list(head)}
+        print(f"LoRA: rank {a.lora_r} on {len(layers)} layers; training {len(trainable)} tensors, {n_train} values")
     teacher = load_model(a.teacher) if a.teacher else None
     if teacher is not None and teacher.config.quantize:
         print(f"note: teacher {a.teacher} is a ternary model; it is used as trained (quantized)")
@@ -147,6 +188,9 @@ def main(argv=None) -> dict:
     summary = {"model": a.model, "quantized": model.config.quantize, "params": n_params,
                "final_test_acc": history["epochs"][-1].get("test_acc"),
                "fp32_state_bytes": packed_state_dict_bytes(model.state_dict())}
+    if lora is not None:
+        save_lora(model, lora["dir"], modules_to_save=lora["modules_to_save"])
+        summary["lora"] = lora
     if model.config.quantize:
         payload = save_packed(model, os.path.join(a.out, "packed.pt"))
         packed = load_packed(os.path.join(a.out, "packed.pt"))

@@ -3,6 +3,7 @@
 
   python scripts/eval.py runs/ternary/model.pt      # training checkpoint (fake quantization)
   python scripts/eval.py runs/ternary/packed.pt     # packed 2-bit inference checkpoint
+  python scripts/eval.py runs/ternary/model.pt --lora runs/lora/lora   # with a LoRA adapter (PEFT format)
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from bitnet_vision.checkpoint import PACKED_FORMAT, load_model, load_packed  # noqa: E402
 from bitnet_vision.export import packed_state_dict_bytes  # noqa: E402
+from bitnet_vision.lora import load_lora  # noqa: E402
 from bitnet_vision.training import evaluate, load_cifar10, ternary_stats  # noqa: E402
 
 
@@ -27,6 +29,8 @@ def main(argv=None) -> dict:
     p.add_argument("--data-dir", default="data")
     p.add_argument("--test-subset", type=int, default=None)
     p.add_argument("--threads", type=int, default=None)
+    p.add_argument("--lora", default=None, help="LoRA adapter to add (directory written by save_lora or PEFT)")
+    p.add_argument("--lora-strength", type=float, default=1.0)
     a = p.parse_args(argv)
     if a.threads:
         torch.set_num_threads(a.threads)
@@ -39,6 +43,8 @@ def main(argv=None) -> dict:
     else:
         model = load_model(a.checkpoint)
         info = {"kind": "training", "ternary": ternary_stats(model) if model.config.quantize else None}
+    if a.lora:
+        info["lora_layers"] = len(load_lora(model, a.lora, name="lora", strength=a.lora_strength))
     info.update(evaluate(model, test_set))
     info["state_bytes"] = packed_state_dict_bytes(model.state_dict())
     info["file_bytes"] = os.path.getsize(a.checkpoint)

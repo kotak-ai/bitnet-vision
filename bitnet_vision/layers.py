@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .hadamard import HadamardTransform
+from .lora import LoRASettings, copy_lora, in_lora_adapter, lora_forward
 from .quant import fake_quant_activations, fake_quant_weights, quantize_weights, ste
 
 __all__ = [
@@ -92,7 +93,12 @@ class BitLinear(nn.Linear):
 
     The full-precision ``weight`` stays the trainable parameter; it is quantized on the fly. Real memory
     and speed savings come from ``bitnet_vision.export.convert_for_inference``.
+
+    LoRA adapters (``bitnet_vision.lora``) are added to the output in full precision; they read the raw input,
+    before the norm and rotation.
     """
+
+    lora_settings: dict[str, LoRASettings] | None = None  # adapters, see bitnet_vision.lora
 
     def __init__(
         self,
@@ -128,6 +134,7 @@ class BitLinear(nn.Linear):
         return x
 
     def forward(self, x: Tensor) -> Tensor:
+        raw = x  # LoRA adapters read the input as given
         in_dtype = x.dtype
         if in_dtype in (torch.float16, torch.bfloat16):
             x = x.float()  # norm, rotation and rounding in float32, so codes match the exported model
@@ -143,7 +150,7 @@ class BitLinear(nn.Linear):
         y = F.linear(x.to(in_dtype), w, self.bias)
         if self.deadzone_lambda and lam > 0:
             y = y + (lam * self.deadzone_lambda) * self.deadzone_rowsum().to(y.dtype)
-        return y
+        return lora_forward(self, raw, y)
 
     def deadzone_rowsum(self) -> Tensor:
         """Per output row, the sum of latent weights whose ternary code is 0 (differentiable in the weights)."""
@@ -163,6 +170,7 @@ class BitLinear(nn.Linear):
         Note: with ``input_norm=True`` (the default) the new layer also normalizes its input, so it only
         computes the same function after (short) fine-tuning. HBitLinear rotates the copied weights so
         that, before quantization, it computes exactly what the original layer computed on its input.
+        LoRA adapters of ``linear`` are copied over unchanged.
         """
         kwargs.setdefault("device", linear.weight.device)
         kwargs.setdefault("dtype", linear.weight.dtype)
@@ -174,6 +182,7 @@ class BitLinear(nn.Linear):
         layer.weight.requires_grad_(linear.weight.requires_grad)
         if layer.bias is not None:
             layer.bias.requires_grad_(linear.bias.requires_grad)
+        copy_lora(linear, layer)
         return layer.train(linear.training)
 
     def _weight_for_input_space(self, weight: Tensor) -> Tensor:
@@ -260,9 +269,9 @@ def convert_linear_layers(
     """Replace every plain ``nn.Linear`` in ``model`` (in place) by ``layer_cls.from_linear``.
 
     ``exclude`` lists qualified module names (or prefixes) to keep in full precision, for example the
-    classifier head. A Linear shared by several parents stays shared. Subclasses of nn.Linear and the
-    projections inside ``nn.MultiheadAttention`` (whose input projection is a raw parameter) are left
-    alone, with a warning for the latter. Returns ``model``.
+    classifier head. A Linear shared by several parents stays shared. Subclasses of nn.Linear, the
+    projections inside ``nn.MultiheadAttention`` (whose input projection is a raw parameter) and the layers
+    of LoRA adapters are left alone, with a warning for attention. Returns ``model``.
     """
     exclude = tuple(exclude)
     replaced: dict[int, BitLinear] = {}
@@ -271,6 +280,8 @@ def convert_linear_layers(
     for name, module in list(model.named_modules(remove_duplicate=False)):
         for child_name, child in list(module._modules.items()):  # includes repeated (shared) children
             full = f"{name}.{child_name}" if name else child_name
+            if in_lora_adapter(full):
+                continue
             if type(child) is nn.Linear and not any(full == e or full.startswith(e + ".") for e in exclude):
                 if id(child) not in replaced:
                     replaced[id(child)] = layer_cls.from_linear(child, **kwargs)

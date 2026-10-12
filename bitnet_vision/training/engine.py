@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..layers import HBitLinear, bitlinear_modules, set_quant_strength
+from ..lora import lora_config
 from .data import TensorDataset, augment, iterate_batches, normalize
 from .distill import distillation_loss
 from .optim import apply_schedule, build_optimizer
@@ -120,7 +121,9 @@ def train(
 ) -> dict[str, Any]:
     """Train ``model`` and return a history dict. Saves ``last.pt`` and ``metrics.json`` in ``out_dir``.
 
-    ``resume`` is a checkpoint dict written by a previous run (see ``last.pt``).
+    Only parameters with ``requires_grad`` are trained (for LoRA, see ``bitnet_vision.lora``). ``resume`` is a
+    checkpoint dict written by a previous run (see ``last.pt``); the model must already have the same LoRA
+    adapters and the same trainable parameters as that run.
     """
     torch.manual_seed(cfg.seed)
     gen = torch.Generator().manual_seed(cfg.seed)
@@ -174,6 +177,12 @@ def train(
         if changed:
             raise ValueError(f"resume: training settings differ from the checkpoint in {changed}; resuming would "
                              "bend the schedule. Use the original settings or start a new run.")
+        if resume.get("lora", {}) != lora_config(model):
+            raise ValueError("resume: the model's LoRA adapters differ from the checkpoint's; add the same adapters "
+                             "before resuming")
+        if "trainable" in resume and resume["trainable"] != _trainable(model):
+            raise ValueError("resume: a different set of parameters is trainable than in the checkpoint (e.g. a "
+                             "changed choice of frozen layers); use the original settings")
         model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
         start_epoch, step = resume["epoch"], resume["step"]
@@ -257,7 +266,10 @@ def train(
             os.makedirs(out_dir, exist_ok=True)
             state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch + 1,
                      "step": step, "rng": gen.get_state(), "torch_rng": torch.get_rng_state(),
-                     "history": history, "model_config": history.get("model_config")}
+                     "history": history, "model_config": history.get("model_config"),
+                     "trainable": _trainable(model)}
+            if lora_config(model):
+                state["lora"] = lora_config(model)
             if torch.cuda.is_available():
                 state["cuda_rng"] = torch.cuda.get_rng_state_all()
             _atomic_save(lambda f, s=state: torch.save(s, f), os.path.join(out_dir, "last.pt"))
@@ -271,6 +283,10 @@ _RUN_SHAPING_FIELDS = (
     "weight_decay", "stage2_weight_decay", "min_lr", "fp_fraction", "quant_ramp_epochs", "final_act_bits",
     "final_act_bits_fraction", "final_act_bits_scope", "seed",
 )
+
+
+def _trainable(model: nn.Module) -> list[str]:
+    return [n for n, p in model.named_parameters() if p.requires_grad]
 
 
 def _atomic_save(write: Callable[[Any], Any], path: str) -> None:

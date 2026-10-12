@@ -16,13 +16,16 @@ output on MLX's CPU backend is bit-identical to ``BitLinearInference``. In float
 enter the matmul divided by 128 (exact), so its output stays far below float16's maximum (raw sums reach
 127 * K, 195,072 at K = 1536) and is rounded only once: Metal's matmul kernels accumulate in float32. MLX's
 CPU quantized matmul accumulates half precision in half precision, so judge half precision on the GPU.
+
+LoRA adapters are added as dense float32 matmuls on the raw input. Their sums are not integers, so they
+match PyTorch to float32 rounding rather than bit for bit.
 """
 
 from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -176,6 +179,15 @@ def _check_supported(layer: BitLinearInference) -> None:
         )
 
 
+def _adapters(layer: BitLinearInference) -> list[tuple[Tensor, Tensor, float]]:
+    """``(A, B, strength * scale)`` in float32 for every enabled LoRA adapter of ``layer``."""
+    return [
+        (layer.lora_A[k].weight.detach().float(), layer.lora_B[k].weight.detach().float(), s.strength * s.scale)
+        for k, s in (layer.lora_settings or {}).items()
+        if s.enabled and s.strength != 0
+    ]
+
+
 def _as_inference_layer(layer: nn.Module) -> BitLinearInference:
     if isinstance(layer, BitLinear):
         layer = convert_for_inference(layer)
@@ -197,6 +209,9 @@ def _classes() -> dict[str, type]:
         The dense variant runs a plain matmul instead of ``mx.quantized_matmul``; in float32 both are exact
         and give identical results. ``dtype`` is the matmul dtype; norm, quantization and the rescale run in
         float32, and the output has the input's dtype.
+
+        ``adapters`` lists LoRA branches as ``(A [r, in], B [out, r], coefficient)``, coefficient being
+        strength times scale; each adds ``coefficient * (x @ A.T) @ B.T`` on the raw input, in float32.
         """
 
         def __init__(
@@ -215,6 +230,7 @@ def _classes() -> dict[str, type]:
             group_size: int | None = None,
             weight: mx.array | None = None,
             dtype: Any = "float32",
+            adapters: Sequence[tuple[Any, Any, float]] = (),
         ) -> None:
             super().__init__()
             if (weight is None) == (w_q is None):
@@ -231,13 +247,19 @@ def _classes() -> dict[str, type]:
             self.norm = bool(norm)
             self.norm_weight = None if norm_weight is None else to_mx(norm_weight, mx.float32)
             self.norm_eps = float(norm_eps)
+            self.lora_A = [to_mx(a, mx.float32) for a, _, _ in adapters]
+            self.lora_B = [to_mx(b, mx.float32) for _, b, _ in adapters]
+            self.lora_scale = [mx.array(float(c), dtype=mx.float32) for _, _, c in adapters]
             self.freeze()
 
         @classmethod
         def from_inference(
             cls, layer: BitLinearInference, group_size: int = 64, dtype: Any = "float32", dense: bool = False
         ) -> MLXBitLinear:
-            """Build from the repo's exported layer (a training ``BitLinear`` is exported first)."""
+            """Build from the repo's exported layer (a training ``BitLinear`` is exported first).
+
+            Enabled LoRA adapters are carried over with their current strength; disabled ones are left out.
+            """
             layer = _as_inference_layer(layer)
             _check_supported(layer)
             dt = _mx_dtype(dtype)
@@ -258,6 +280,7 @@ def _classes() -> dict[str, type]:
                 norm_weight=None if norm is None or norm.weight is None else to_mx(norm.weight.float()),
                 norm_eps=norm.eps if norm is not None else 1e-6,
                 dtype=dt,
+                adapters=_adapters(layer),
                 **weights,
             )
 
@@ -290,13 +313,20 @@ def _classes() -> dict[str, type]:
             y = acc / x_scale * self.weight_scale  # same operation order as BitLinearInference
             if self.bias is not None:
                 y = y + self.bias
+            if self.lora_A:
+                xf = x.astype(mx.float32)
+                delta = None
+                for a, b, c in zip(self.lora_A, self.lora_B, self.lora_scale):
+                    d = ((xf @ a.T) @ b.T) * c
+                    delta = d if delta is None else delta + d
+                y = y + delta
             return y.astype(out_dtype)
 
         def _extra_repr(self) -> str:
             kind = f"packed 2-bit, group_size={self.group_size}" if self.packed else "dense"
             return (
                 f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, "
-                f"norm={self.norm}, {kind}, dtype={self.compute_dtype}"
+                f"norm={self.norm}, {kind}, dtype={self.compute_dtype}, adapters={len(self.lora_A)}"
             )
 
     class MLXBlock(mnn.Module):
@@ -393,7 +423,8 @@ def mlx_block_from_vit_block(
     """MLX version of one ``bitnet_vision.models.vit.Block``: an :class:`MLXBlock` to call on (B, N, C) arrays.
 
     Pass the block after ``convert_for_inference`` (training BitLinear layers are exported on the fly). Each
-    linear layer becomes an :class:`MLXBitLinear`; LayerNorm, softmax attention and GELU run in ``dtype``.
+    linear layer becomes an :class:`MLXBitLinear`, with its enabled LoRA adapters; LayerNorm, softmax
+    attention and GELU run in ``dtype``.
     """
     dt = _mx_dtype(dtype)
     linear = functools.partial(_classes()["MLXBitLinear"].from_inference, group_size=group_size, dtype=dt, dense=dense)

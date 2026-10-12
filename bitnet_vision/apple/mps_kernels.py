@@ -42,6 +42,7 @@ from torch import Tensor, nn
 from ..export import BitLinearInference, convert_for_inference, unpack_ternary
 from ..hadamard import autocast_disabled
 from ..layers import BitLinear, RMSNorm
+from ..lora import copy_lora, lora_forward
 from ..quant import QUANT_EPS, quantize_activations
 
 __all__ = [
@@ -337,7 +338,8 @@ class FusedBitLinearInference(BitLinearInference):
     device (4 bytes per weight). The forward pass is front end, float32 ``F.linear`` with autocast off, then
     epilogue. Layers that are not 8-bit absmax (4-bit, or full-precision activations) and float64 inputs use
     BitLinearInference's forward. Run it under ``torch.no_grad()`` or ``torch.inference_mode()``: when
-    autograd has to record an input, the reference ops run instead of the kernels.
+    autograd has to record an input, the reference ops run instead of the kernels. LoRA adapters run as
+    plain float32 ``F.linear`` calls on the raw input, added after the epilogue.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -351,7 +353,7 @@ class FusedBitLinearInference(BitLinearInference):
     @classmethod
     @torch.no_grad()
     def from_inference(cls, layer: BitLinearInference) -> FusedBitLinearInference:
-        """A fused layer that shares ``layer``'s buffers, norm and Hadamard modules."""
+        """A fused layer that shares ``layer``'s buffers, norm, Hadamard modules and LoRA adapters."""
         new = cls(
             layer.in_features,
             layer.out_features,
@@ -370,6 +372,7 @@ class FusedBitLinearInference(BitLinearInference):
             new.bias = layer.bias
         new.norm = layer.norm
         new.hadamard = layer.hadamard
+        copy_lora(layer, new, share=True)
         new.train(layer.training)
         if new.weight_packed.device.type != "meta":
             new._float_codes()
@@ -387,7 +390,7 @@ class FusedBitLinearInference(BitLinearInference):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.act_bits != 8 or self.act_method != "absmax" or x.dtype == torch.float64:
-            return super().forward(x)
+            return super().forward(x)  # adds the adapters itself
         norm = self.norm
         if self.hadamard is None and type(norm) is RMSNorm and norm.weight is not None:
             codes, x_scale = fused_front_end(x, norm.weight, norm.eps)
@@ -398,7 +401,7 @@ class FusedBitLinearInference(BitLinearInference):
             codes, x_scale = fused_front_end(h, None, 0.0)
         with autocast_disabled(codes.device.type):
             acc = F.linear(codes, self._float_codes())
-        return fused_epilogue(acc, x_scale, self.weight_scale, self.bias).to(x.dtype)
+        return lora_forward(self, x, fused_epilogue(acc, x_scale, self.weight_scale, self.bias).to(x.dtype))
 
 
 def convert_to_fused(model: nn.Module, inplace: bool = False) -> nn.Module:

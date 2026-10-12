@@ -14,9 +14,11 @@ jobs:
           - python: "3.10"
             torch: "torch==2.2.2"
             numpy: "numpy<2"
+            extras: "dev"
           - python: "3.12"
             torch: "torch"
             numpy: "numpy"
+            extras: "dev,lora"  # also the safetensors path of the LoRA files
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,7 +29,7 @@ jobs:
           pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
           pip install "${{ matrix.numpy }}"
       - name: Install package
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[${{ matrix.extras }}]"
       - name: Lint
         run: ruff check .
       - name: Test

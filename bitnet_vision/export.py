@@ -37,6 +37,7 @@ from torch import Tensor, nn
 
 from .hadamard import HadamardTransform, autocast_disabled
 from .layers import BitLinear, HBitLinear, RMSNorm
+from .lora import LoRASettings, copy_lora, lora_forward
 from .quant import quantize_activations, quantize_weights
 
 __all__ = [
@@ -126,7 +127,11 @@ class BitLinearInference(nn.Module):
         keep_unpacked: keep an int8 copy of the weights in memory after the first call (default; 1 byte per
             weight). With False the weights are unpacked on every call, which saves memory and costs time.
             The copy is dropped automatically when new weights are loaded.
+
+    LoRA adapters run as in BitLinear: full precision, on the raw input, added after the bias.
     """
+
+    lora_settings: dict[str, LoRASettings] | None = None  # adapters, see bitnet_vision.lora
 
     def __init__(
         self,
@@ -204,6 +209,7 @@ class BitLinearInference(nn.Module):
         if layer.norm is not None:
             new.norm = copy.deepcopy(layer.norm)
             new.norm.weight.requires_grad_(False)
+        copy_lora(layer, new)
         return new.to(layer.weight.device)
 
     def _codes(self, dtype: torch.dtype, transposed: bool = False) -> Tensor:
@@ -240,6 +246,7 @@ class BitLinearInference(nn.Module):
         return out.reshape(*lead, self.out_features)
 
     def forward(self, x: Tensor) -> Tensor:
+        raw = x
         if self.norm is not None:
             x = self.norm(x)
         if self.hadamard is not None:
@@ -256,7 +263,7 @@ class BitLinearInference(nn.Module):
                 y = self._int_matmul(codes) / x_scale * self.weight_scale.float()
         if self.bias is not None:
             y = y + self.bias.to(y.dtype)
-        return y.to(x.dtype)
+        return lora_forward(self, raw, y.to(x.dtype))
 
     def extra_repr(self) -> str:
         return (
@@ -270,7 +277,8 @@ def convert_for_inference(model: nn.Module, inplace: bool = False, **kwargs: Any
     """Replace every BitLinear / HBitLinear in ``model`` with a packed ``BitLinearInference``.
 
     ``model`` may itself be a BitLinear. Extra keyword arguments (``int_matmul``, ``keep_unpacked``) are
-    passed to each new layer. A layer shared by several parents stays shared.
+    passed to each new layer. A layer shared by several parents stays shared. LoRA adapters are copied over
+    and stay in full precision.
     """
     if isinstance(model, BitLinear):
         return BitLinearInference.from_bitlinear(model, **kwargs).eval()

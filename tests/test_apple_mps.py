@@ -15,6 +15,7 @@ flip that rounding for the token's largest value, so its scale may differ by up 
 order as on the CPU, so the result should be bit-exact; a dedicated test checks that.
 """
 
+import copy
 import math
 import re
 
@@ -34,6 +35,7 @@ from bitnet_vision.apple.mps_kernels import (
 )
 from bitnet_vision.export import BitLinearInference, convert_for_inference, unpack_ternary
 from bitnet_vision.layers import BitLinear, HBitLinear, RMSNorm
+from bitnet_vision.lora import add_lora, disable_lora, set_lora_strength
 from bitnet_vision.models import create_model
 from bitnet_vision.quant import quantize_activations
 
@@ -65,6 +67,20 @@ def _inference_layer(cls=BitLinear, k: int = 192, n: int = 50, seed: int = 0, **
         if layer.norm is not None:
             layer.norm.weight.uniform_(0.5, 1.5)
     return BitLinearInference.from_bitlinear(layer)
+
+
+def _with_adapters(layer: BitLinearInference, seed: int = 0) -> BitLinearInference:
+    """``layer`` with two non-zero LoRA adapters (one at half strength) and a third, disabled one."""
+    for name, r in (("default", 4), ("b", 2), ("off", 2)):
+        add_lora(layer, r=r, name=name, targets=None)
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for k in layer.lora_settings:
+            for w in (layer.lora_A[k].weight, layer.lora_B[k].weight):
+                w.copy_(0.1 * torch.randn(w.shape, generator=g))
+    set_lora_strength(layer, 0.5, "b")
+    disable_lora(layer, "off")
+    return layer
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -153,6 +169,22 @@ def test_fused_layer_falls_back_for_other_activation_settings(cls, kwargs):
     x = torch.randn(4, 192, generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
         assert torch.equal(fused(x), inf(x))
+
+
+@pytest.mark.parametrize("cls,kwargs", LAYER_VARIANTS[:2] + LAYER_VARIANTS[-3:] + [
+    (HBitLinear, {"act_bits": 4}), (BitLinear, {"act_bits": None}),
+])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.float64])
+def test_fused_layer_applies_lora_adapters_like_the_inference_layer(cls, kwargs, dtype):
+    inf = _with_adapters(_inference_layer(cls, **kwargs))
+    fused = FusedBitLinearInference.from_inference(inf)
+    assert fused.lora_settings is inf.lora_settings  # shared, like the buffers
+    x = (3 * torch.randn(3, 9, 192, generator=torch.Generator().manual_seed(1))).to(dtype)
+    with torch.no_grad():
+        y = fused(x)
+        assert y.dtype == dtype and torch.equal(y, inf(x))
+        disable_lora(inf)
+        assert not torch.equal(fused(x), y) and torch.equal(fused(x), inf(x))
 
 
 def test_fused_layer_float64_and_odd_shapes():
@@ -427,6 +459,23 @@ def test_metal_fused_layer_close_to_cpu_inference_layer(cls, kwargs, dtype):
     step = inf.weight_scale / x_scale  # one activation code times one weight, in output units
     bound = 2e-3 * (y_ref.abs() + (y_ref - bias).abs()) + 3 * step + 1e-5
     assert y.dtype == dtype and ((y.float() - y_ref).abs() <= bound).all()
+
+
+@requires_metal
+def test_metal_fused_layer_adds_lora_adapters_in_float32():
+    inf = _with_adapters(_inference_layer(k=384, n=1536))
+    fused = FusedBitLinearInference.from_inference(copy.deepcopy(inf)).to("mps")
+    x = 3 * torch.randn(2, 266, 384, generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        y_ref = inf(x)
+        disable_lora(inf)
+        delta_ref = y_ref - inf(x)
+        y = fused(x.to("mps"))
+        with torch.autocast(device_type="mps", dtype=torch.float16):
+            assert torch.equal(fused(x.to("mps")), y)  # the branch stays float32 under autocast
+        set_lora_strength(fused, 0.0, None)
+        delta = (y - fused(x.to("mps"))).cpu()
+    torch.testing.assert_close(delta, delta_ref, rtol=1e-4, atol=1e-5 * y_ref.abs().max().item())
 
 
 @requires_metal
