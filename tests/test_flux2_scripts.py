@@ -285,3 +285,16 @@ def test_realign_with_continuous_timesteps_keeps_the_teacher(script, tmp_path):
 def test_realign_refuses_several_loras(script, tmp_path):
     with pytest.raises(SystemExit, match="exactly one --lora"):
         script.main(["realign", "--tiny", "--out", str(tmp_path), "--lora", "a", "--lora", "b", "--quiet"])
+
+
+def test_default_size_follows_gpu_memory(monkeypatch):
+    # a 16 GB Mac (11.8 GB GPU working set) gets 512 x 512 by default, a 96 GB one 1024 x 1024
+    m = _load_script()
+    mps = torch.device("mps")
+    monkeypatch.setattr(m, "device_memory_gb", lambda device: 11.8)
+    assert m.default_size(mps, tiny=False) == 512
+    monkeypatch.setattr(m, "device_memory_gb", lambda device: 72.0)
+    assert m.default_size(mps, tiny=False) == 1024
+    monkeypatch.setattr(m, "device_memory_gb", lambda device: None)
+    assert m.default_size(mps, tiny=False) == 1024
+    assert m.default_size(torch.device("cpu"), tiny=False) == 512 and m.default_size(mps, tiny=True) == 32

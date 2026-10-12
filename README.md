@@ -321,16 +321,19 @@ metrics, timings and memory readings). If PyTorch reports an operation missing o
 `PYTORCH_ENABLE_MPS_FALLBACK=1`. Downloads, about 17.6 GB in all: the Bonsai pack (1.43 GB), the text
 encoder, tokenizer and VAE (8.2 GB), klein 4B's transformer (7.75 GB, only for `compare` and `realign`) and
 the LoRA. Only one transformer is in memory at a time, and the text encoder (8 GB, the largest part) is freed
-once the prompts are encoded, so 96 GB is far more than any command needs.
+once the prompts are encoded, so 96 GB is far more than any command needs. A 16 GB Mac (an 11.8 GB GPU
+working set) also runs them, with little room: the size drops to 512 x 512, other apps should be closed, and
+`--text-encoder-device cpu` encodes the prompts on the CPU if loading the text encoder runs out of memory.
 
 The three commands (`--device` and `--dtype` pick other devices and dtypes; `--tiny` runs any of them on a
 tiny random pipeline built on the spot, which is what the tests do):
 
 * **generate**: Bonsai, packed, with any number of `--lora SOURCE[:STRENGTH]`. `SOURCE` is a file, a folder,
   a repo id, or `owner/repo/file.safetensors` for a repo holding several files. 4 steps and guidance 1.0 as
-  the model cards say; 1024 x 1024 on a GPU, 512 x 512 on the CPU. The loop repeats `Flux2KleinPipeline`'s
-  own, so for the same noise the image is exactly the pipeline's. The text encoder and VAE come from Bonsai's
-  unpacked repo; they are byte-identical to klein 4B's (same SHA-256), so one encoding serves both bases.
+  the model cards say; 1024 x 1024 on a GPU with 24 GB or more, 512 x 512 on smaller ones and the CPU. The
+  loop repeats `Flux2KleinPipeline`'s own, so for the same noise the image is exactly the pipeline's. The text
+  encoder and VAE come from Bonsai's unpacked repo; they are byte-identical to klein 4B's (same SHA-256), so
+  one encoding serves both bases.
 * **compare**: the same prompts, seeds and noise through (a) klein 4B, (b) klein 4B + LoRA, (c) Bonsai,
   (d) Bonsai + LoRA, and with `--realigned` (e) Bonsai + the re-aligned LoRA. With D = (with LoRA) minus
   (without), on the same base: `first_step_cos` and `first_step_norm` compare D of the transformer's output
@@ -472,8 +475,8 @@ records the machine state, so compare numbers only from a quiet machine.
 
 ## Apple Silicon (experimental)
 
-`bitnet_vision.apple` has two inference paths for Macs. Both were written and checked on Linux and have
-**not yet run on Apple hardware**; `scripts/apple_check.py` and `scripts/apple_bench.py` are the first test.
+`bitnet_vision.apple` has two inference paths for Macs. Both were written on Linux and first ran on a Mac
+(an M2 Pro) on 2026-10-12; the numbers are below.
 
 * `convert_to_fused(model)` (PyTorch, MPS backend): two Metal kernels replace the dozen or so small steps
   around each ternary layer (RMSNorm and rounding to 8 bits in one pass, rescale and bias in another). The
@@ -499,6 +502,31 @@ python scripts/apple_bench.py      # speed: layers, whole models, training throu
 
 Both write a JSON report to `apple_results/`. Run the benchmark plugged in, with Low Power Mode off.
 
+**First Mac run** (M2 Pro, 16 GPU cores, 16 GB, macOS 27.0, PyTorch 2.14.1, MLX 0.32.3, commit 47f166e; other
+programs were running, load average 11 to 17, so treat the speeds as rough):
+
+* **Correctness:** 64 of 65 checks passed on the GPU against a float64 CPU reference, among them the Metal
+  kernels (compiled on the first try; codes match the CPU), the MLX path, forward-mode AD through explicit
+  attention, the packed model under float16 autocast, LoRA adapters and training steps. The remaining one is a
+  PyTorch bug on M1/M2 GPUs that this repo never triggers: `torch.bmm` gives wrong results when it sums over
+  more than 32,768 values (PyTorch 2.14 fixed `mm` and `linear`, not `bmm`); the check now reports it as a
+  known issue. `F.scaled_dot_product_attention` has no forward-mode AD on the Mac GPU, as expected, so
+  one-step (JVP) training must use explicit attention.
+* **Speed of one ternary layer** (S/2 fc2, 1536 to 384, at 17,024 tokens): unfused packed layer 30.1 ms, fused
+  Metal kernels 6.9 ms (4.4 times faster), plain float32 `F.linear` 4.5 ms. Over all layer shapes the fused
+  path ran at 0.5 to 0.87 times the speed of a plain float32 matmul and 2 to 6 times the unfused one.
+* **Whole T/4-sized model**, images per second:
+
+  | Batch | Full precision (fp32) | Packed | Fused Metal | MLX 2-bit compiled |
+  |---|---|---|---|---|
+  | 1 | 327 | 242 | 440 | 906 |
+  | 8 | 1,492 | 845 | 2,242 | 3,249 |
+  | 64 | 2,299 | 1,074 | 3,922 | 3,767 |
+  | 256 | 2,300 | 1,067 | 4,313 | 3,486 |
+
+  The fused and MLX paths beat the full-precision twin mainly because that twin still runs BitLinear's
+  unfused RMSNorm, not because ternary arithmetic is faster. MLX's numbers cover the transformer blocks only.
+
 ## Checkpoint format
 
 `save_packed` writes `{"format": "bitnet_vision.packed.v1", "conventions": ..., "model_config": ...,
@@ -519,10 +547,11 @@ export equivalence, resume exactness, LoRA adapters against their formula and th
 checkpoints (and against the PEFT library when it is installed), and short end-to-end training runs. With the
 `flux` extra, 26 more check the FLUX.2 code on a tiny `Flux2Transformer2DModel`: both Bonsai file layouts, and
 every LoRA format against diffusers' own loading on the dense model, in float32, plus every refusal (no network
-needed). 11 more run `scripts/flux2_lora.py` with `--tiny`: its sampler against `Flux2KleinPipeline` bit for
+needed). 12 more run `scripts/flux2_lora.py` with `--tiny`: its sampler against `Flux2KleinPipeline` bit for
 bit (float32, bfloat16, and with guidance), all three commands, retention exactly 1 when both bases hold the
 same weights, a lower loss after `realign`, and the re-aligned LoRA loading in diffusers and in
-`load_flux2_lora` with the same result. 3 of the FLUX.2 and weight-only tests run only on an Apple GPU.
+`load_flux2_lora` with the same result, plus the image size it picks on a small-memory Mac. 3 of the
+FLUX.2 and weight-only tests run only on an Apple GPU.
 `python tools/mutation_test.py` plants 62 known bugs one at a time (including every bug found in the old
 branches) and checks that the tests catch each one.
 

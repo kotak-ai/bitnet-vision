@@ -58,7 +58,7 @@ def _rows(result, path):
     for key in ("python", "torch", "git_commit", "mps_available", "metal_kernels_available", "mlx"):
         assert key in saved["environment"]
     for row in saved["rows"]:
-        assert row["status"] in ("ok", "FAILED", "skipped"), row
+        assert row["status"] in ("ok", "FAILED", "known", "skipped"), row
         if row["status"] != "ok":
             assert row["message"], row
     return saved["rows"]

@@ -89,6 +89,9 @@ as nothing has run on a Mac yet):
     time, plus the LoRA's gradients and AdamW's two float32 copies. --timesteps continuous adds the teacher.
   Peak, estimated: 10 to 16 GB for every command (the text encoder phase is the largest), so all of it fits
   easily; time is the limit on this Mac.
+On a 16 GB Mac (11.8 GB GPU working set, e.g. an M2 Pro) the same plan fits but with little room: the default size
+drops to 512 x 512, close other apps, and if loading the text encoder runs out of memory, encode on the CPU with
+--text-encoder-device cpu. Ternary matters here: dense klein 4B alone takes 7.75 GB, packed Bonsai 1.37 GB.
 
 Time on an M2 Max, estimated from arithmetic (2 x 3.7 G weights x tokens per pass, about 7 TFLOPS in bfloat16 on
 the GPU), not measured: one transformer pass takes about 1.7 s at 512 x 512 and 6 s at 1024 x 1024, so an image
@@ -215,8 +218,28 @@ def pick_size(text: str | None, default: int, multiple: int) -> tuple[int, int]:
     return width, height
 
 
+def device_memory_gb(device: torch.device) -> float | None:
+    """Memory the device may use, in GB: the GPU working set on a Mac, the card's memory on CUDA, else None."""
+    try:
+        if device.type == "mps" and hasattr(torch.mps, "recommended_max_memory"):
+            return torch.mps.recommended_max_memory() / 1e9
+        if device.type == "cuda":
+            return torch.cuda.get_device_properties(device).total_memory / 1e9
+    except (RuntimeError, AttributeError):
+        pass
+    return None
+
+
+SMALL_GPU_GB = 24.0  # below this, default to 512 x 512: a 16 GB Mac has an 11.8 GB GPU working set
+
+
 def default_size(device: torch.device, tiny: bool) -> int:
-    return 32 if tiny else 512 if device.type == "cpu" else 1024
+    if tiny:
+        return 32
+    if device.type == "cpu":
+        return 512
+    memory = device_memory_gb(device)
+    return 512 if memory is not None and memory < SMALL_GPU_GB else 1024
 
 
 def release(device: torch.device) -> None:
@@ -460,9 +483,11 @@ def load_components(sources: Sources, dtype: torch.dtype, run: Run) -> Any:
 @torch.no_grad()
 def encode_prompts(pipe: Any, prompts: list[str], device: torch.device, max_sequence_length: int,
                    run: Run) -> dict[str, tuple[Tensor, Tensor]]:
-    """``{prompt: (embeddings [1, L, D], text ids [1, L, 4])}`` on the CPU; then the text encoder is freed."""
+    """``{prompt: (embeddings [1, L, D], text ids [1, L, 4])}`` on the CPU; then the text encoder is freed.
+
+    ``device`` is where the text encoder runs (``--text-encoder-device``)."""
     out = {}
-    with run.phase("encode prompts", f"{len(set(prompts))} prompts, then free the text encoder"):
+    with run.phase("encode prompts", f"{len(set(prompts))} prompts on {device.type}, then free the text encoder"):
         pipe.text_encoder.to(device)
         for prompt in dict.fromkeys(prompts):
             embeds, ids = pipe.encode_prompt(prompt=prompt, device=device, max_sequence_length=max_sequence_length)
@@ -845,7 +870,8 @@ def setup(command: str, args: argparse.Namespace, prompts_for: Any, default_size
     cfg = args.guidance > 1 and not pipe.config.is_distilled
     if args.guidance > 1 and pipe.config.is_distilled:
         run.log(f"  note: guidance {args.guidance} is ignored, the model is step-distilled (as in diffusers)")
-    conds = encode_prompts(pipe, prompts + ([""] if cfg else []), device, args.max_sequence_length, run)
+    te_device = device if args.text_encoder_device == "auto" else torch.device(args.text_encoder_device)
+    conds = encode_prompts(pipe, prompts + ([""] if cfg else []), te_device, args.max_sequence_length, run)
     pipe.vae.to(device)
     return Setup(run, sources, loras, pipe, width, height, list(dict.fromkeys(prompts)), conds,
                  conds[""] if cfg else None, args.guidance)
@@ -1334,6 +1360,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--dtype", default="auto", choices=["auto", *DTYPES],
                    help="model dtype (auto: bfloat16, the models' own, float32 with --tiny). bfloat16 on an Apple "
                         "GPU needs macOS 14 or newer; float16 can overflow in FLUX.2's activations")
+    g.add_argument("--text-encoder-device", default="auto", choices=["auto", "cpu"],
+                   help="where the 8 GB text encoder runs once to encode the prompts: auto (the main device) or cpu "
+                        "(slower, but leaves the GPU free; try it if a 16 GB Mac runs out of memory)")
     g.add_argument("--cache-dense", action="store_true",
                    help="keep each packed layer's dense weight after its first call (faster, but as much memory "
                         "as the full-precision model)")
@@ -1344,7 +1373,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = common.add_argument_group("sampling")
     s.add_argument("--prompt", action="append", help="a prompt (repeatable)")
     s.add_argument("--prompts", metavar="FILE", help="a text file with one prompt per line")
-    s.add_argument("--size", help="N or WxH in pixels (default 1024 on a GPU, 512 on the CPU; realign: 512)")
+    s.add_argument("--size", help="N or WxH in pixels (default 1024 on a GPU with 24 GB or more, otherwise 512, "
+                                  "e.g. on a 16 GB Mac; realign: 512)")
     s.add_argument("--sample-steps", type=int, default=STEPS, help=f"sampler steps (default {STEPS})")
     s.add_argument("--guidance", type=float, default=GUIDANCE,
                    help=f"guidance scale (default {GUIDANCE}; ignored by step-distilled models)")

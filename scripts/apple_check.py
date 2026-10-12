@@ -22,8 +22,8 @@ Items: 1 torch version and device, 2 BitLinear and HBitLinear forward and backwa
 over more than 32768 rows (pytorch#177116, M1/M2 GPUs), 4 forward-mode AD (torch.func.jvp) through attention and an
 iMF-style step, 5 the packed model (convert_for_inference) and autocast, 6 the fused Metal kernels, 7 MLX, 8 one
 training step of a T/4-sized BitViT. Items 5, 6 and 8 also run with LoRA adapters (bitnet_vision.lora). Each row
-reports ok, FAILED (with the error) or skipped (with the reason). The table is printed and everything, with the
-machine's details, goes to apple_results/apple_check-<time>.json.
+reports ok, FAILED (with the error), known (a PyTorch bug this repo does not hit) or skipped (with the reason).
+The table is printed and everything, with the machine's details, goes to apple_results/apple_check-<time>.json.
 
 Shapes: TernFlow's T/4 (width 192, MLP 768, 74 tokens per image) and S/2 (384, 1536, 266 tokens). The BitViT
 stand-ins built with create_model have 65 and 257 tokens per 32x32 image.
@@ -76,7 +76,7 @@ warnings.filterwarnings("ignore", message=r"`torch\.jit\.script` is deprecated",
 # ---------------------------------------------------------------------------------------------------------------
 # Shared with scripts/apple_bench.py
 
-STATUSES = ("ok", "FAILED", "skipped")
+STATUSES = ("ok", "FAILED", "known", "skipped")
 # create_model overrides for the BitViT stand-ins of TernFlow's two sizes; the quick ones are for dry runs.
 MODELS = {
     "T/4": dict(embed_dim=192, depth=6, num_heads=3, mlp_ratio=4.0, patch_size=4, img_size=32, num_classes=10),
@@ -342,7 +342,8 @@ class Report:
         return self.data["environment"]
 
     def run(self, row_id: str, name: str, fn: Callable[[], dict | None], **fields: Any) -> dict:
-        """Run ``fn`` and record its row: ok (FAILED if it returns ok=False), FAILED if it raises, skipped on Skip."""
+        """Run ``fn`` and record its row: ok (FAILED if it returns ok=False, or known when it also returns
+        known=True: a PyTorch bug this repo does not hit), FAILED if it raises, skipped on Skip."""
         row: dict[str, Any] = {"id": row_id, "name": name, **fields}
         t = time.perf_counter()
         try:
@@ -352,8 +353,9 @@ class Report:
         except Exception as e:  # noqa: BLE001 - a failure is a result: record it and go on
             row.update(status="FAILED", message=f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
         else:
-            ok = result.pop("ok", True)
-            row.update(status="ok" if ok else "FAILED", message=result.pop("message", ""), **result)
+            ok, known = result.pop("ok", True), result.pop("known", False)
+            row.update(status="ok" if ok else "known" if known else "FAILED", message=result.pop("message", ""),
+                       **result)
         row["seconds"] = round(time.perf_counter() - t, 3)
         self.rows.append(row)
         print(self.line(row), flush=True)
@@ -380,7 +382,8 @@ class Report:
             os, "getloadavg") else None
         self.save()
         c = self.counts()
-        print(f"\n{c['ok']} ok, {c['FAILED']} FAILED, {c['skipped']} skipped in {self.data['elapsed_s']:.0f} s. "
+        print(f"\n{c['ok']} ok, {c['FAILED']} FAILED, {c['known']} known PyTorch issues, {c['skipped']} skipped in "
+              f"{self.data['elapsed_s']:.0f} s. "
               f"Results: {self.path}")
 
 
@@ -761,8 +764,11 @@ class Checks:
         dev, ref, cpu = run_three(run, inputs, self.device)
         result = verdict(compare(dev, ref, cpu, 1e-5), note=f"reduces over {rows:,} rows")
         if kind == "bmm" and not result["ok"]:
-            result["message"] += ("; known: the 2.14 fix covers mm and linear, not bmm (pytorch#183535). BitViT and "
-                                  "TernFlow have no bmm that long")
+            # a real PyTorch bug on M1/M2 GPUs, but nothing in this repo runs a bmm that long: attention reduces over
+            # head_dim and the token count (at most a few thousand), so report it without failing the run
+            result["known"] = True
+            result["message"] += ("; known PyTorch bug on M1/M2 GPUs: the 2.14 fix covers mm and linear, not bmm "
+                                  "(pytorch#183535). Nothing in this repo runs a bmm that long")
         return result
 
     # 4 -------------------------------------------------------------------------------------------------------
