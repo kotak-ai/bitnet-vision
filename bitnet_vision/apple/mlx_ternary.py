@@ -6,7 +6,10 @@ MLX is optional: nothing here imports it until a function or class that needs it
 Weights. MLX's 2-bit affine format dequantizes ``w = scale * q + bias`` with codes ``q`` packed 16 per
 uint32 along the input (K) axis, least significant bits first, and one scale and bias per group of K.
 Storing ``q = code + 1`` with ``scale = g`` and ``bias = -g`` represents ``W = codes * g`` exactly.
-``mx.quantize(bits=2)`` does not: its zero-preserving rounding turns ``-g`` into ``-g / 2``.
+``mx.quantize(bits=2)`` does not: its zero-preserving rounding turns ``-g`` into ``-g / 2``. PrismML's Bonsai
+Image MLX pack stores its ternary layers in exactly this encoding, with one scale per group of 128 inputs.
+:func:`encode_mlx_ternary` and :func:`decode_mlx_ternary` convert between it and ternary codes in plain PyTorch
+(no MLX needed); :func:`pack_ternary_mlx` builds MLX arrays.
 
 Arithmetic. ``MLXBitLinear`` computes exactly what the repo's layer computes: RMSNorm and per-token int8
 absmax quantization in float32, an integer matmul (activation codes times ternary codes, weights stored
@@ -40,8 +43,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GROUP_SIZES",
+    "encode_mlx_ternary",
+    "decode_mlx_ternary",
     "pack_ternary_mlx",
     "from_packed_repo",
+    "from_packed_ternary_linear",
     "mlx_block_from_vit_block",
     "compiled",
     "to_mx",
@@ -108,27 +114,111 @@ def to_torch(x: Any, dtype: torch.dtype | None = None) -> Tensor:
     return out if dtype is None else out.to(dtype)
 
 
-def _row_scales(weight_scale: Any, rows: int) -> np.ndarray:
+_CODES_PER_WORD = 16  # 2-bit codes per uint32
+_DECODE_ROWS = 2048  # rows decoded at a time, so a large layer needs little extra memory
+
+
+def encode_mlx_ternary(codes: Tensor, scales: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """MLX's 2-bit affine layout of ``W = codes * scales``, in PyTorch: ``(w_q, scales, -scales)``.
+
+    ``codes`` is [N, K] in {-1, 0, 1} and ``scales`` is [N, K / g] (one scale per group of g inputs). ``w_q`` is
+    [N, K / 16] with ``code + 1`` in 2 bits each, least significant bits first along K: uint32, or int32 with
+    the same bits on PyTorch versions without ``torch.uint32`` (before 2.3). This is the layout of
+    :func:`pack_ternary_mlx` and of the Bonsai Image MLX pack.
+    """
+    if codes.dim() != 2 or scales.dim() != 2 or scales.shape[0] != codes.shape[0]:
+        raise ValueError(f"codes must be [N, K] and scales [N, K / group], got {tuple(codes.shape)} and "
+                         f"{tuple(scales.shape)}")
+    n, k = codes.shape
+    if k % _CODES_PER_WORD or k % scales.shape[1]:
+        raise ValueError(f"K={k} must be a multiple of 16 and of the number of scale groups ({scales.shape[1]})")
+    if codes.numel() and (codes.min() < -1 or codes.max() > 1):
+        raise ValueError("codes must hold only -1, 0 and 1")
+    q = (codes.to(torch.int64) + 1).reshape(n, k // _CODES_PER_WORD, _CODES_PER_WORD)
+    shifts = torch.arange(0, 32, 2, dtype=torch.int64, device=codes.device)
+    words = (q << shifts).sum(dim=-1)  # disjoint bits, so the sum is the bitwise or
+    w_q = words.to(torch.uint32) if hasattr(torch, "uint32") else (words - (words >> 31 << 32)).to(torch.int32)
+    return w_q, scales, -scales
+
+
+def decode_mlx_ternary(w_q: Tensor, scales: Tensor, biases: Tensor, name: str = "weight") -> tuple[Tensor, Tensor]:
+    """Read an MLX 2-bit affine tensor that holds ternary weights: returns int8 codes [N, K] and ``scales``.
+
+    Checks that it is ternary in the exact encoding above: ``biases == -scales`` everywhere and every code is
+    0, 1 or 2 (so ``w = scale * q + bias = scale * (q - 1)``). Raises ValueError otherwise. ``w_q`` may be
+    uint32 or int32 (the same bits).
+    """
+    if w_q.dim() != 2 or scales.shape != biases.shape or scales.dim() != 2 or scales.shape[0] != w_q.shape[0]:
+        raise ValueError(f"{name}: expected weight [N, K / 16] and scales, biases [N, K / group], got "
+                         f"{tuple(w_q.shape)}, {tuple(scales.shape)}, {tuple(biases.shape)}")
+    if not torch.equal(biases, -scales):
+        diff = (biases != -scales).sum().item()
+        raise ValueError(f"{name}: biases differ from -scales in {diff} groups, so the layer is not ternary "
+                         "(an ordinary 2-bit layer has four levels per group)")
+    if getattr(torch, "uint32", None) is not None and w_q.dtype == torch.uint32:
+        w_q = w_q.view(torch.int32)
+    elif w_q.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"{name}: expected uint32 or int32 packed codes, got {w_q.dtype}")
+    n, words = w_q.shape
+    k = words * _CODES_PER_WORD
+    if k % scales.shape[1]:
+        raise ValueError(f"{name}: K={k} is not a multiple of the number of scale groups ({scales.shape[1]})")
+    shifts = torch.arange(0, 32, 2, dtype=w_q.dtype, device=w_q.device)
+    codes = torch.empty(n, k, dtype=torch.int8, device=w_q.device)
+    for r0 in range(0, n, _DECODE_ROWS):
+        q = (w_q[r0 : r0 + _DECODE_ROWS].unsqueeze(-1) >> shifts) & 3  # arithmetic shift keeps the low bits right
+        if (q == 3).any():
+            raise ValueError(f"{name}: holds 2-bit code 3, which a ternary layer never uses")
+        codes[r0 : r0 + _DECODE_ROWS] = (q.reshape(q.shape[0], k) - 1).to(torch.int8)
+    return codes, scales
+
+
+def _scale_matrix(weight_scale: Any, rows: int, k: int, group_size: int | None) -> tuple[np.ndarray, int]:
+    """float32 scales [rows, k / group_size] for MLX, from a scalar, one value per row, or [rows, groups]."""
     import numpy as np
 
-    s = np.asarray(_numpy(weight_scale), dtype=np.float32).reshape(-1)
+    s = np.asarray(_numpy(weight_scale), dtype=np.float32)
+    if s.ndim == 2 and s.shape[0] == rows and s.shape[1] > 1:  # one scale per group of inputs
+        if k % s.shape[1]:
+            raise ValueError(f"in_features={k} is not a multiple of the {s.shape[1]} scale groups")
+        span = k // s.shape[1]
+        valid = [g for g in GROUP_SIZES if span % g == 0]
+        if group_size is None:
+            if not valid:
+                raise ValueError(f"scale groups of {span} inputs fit none of MLX's group sizes {GROUP_SIZES}")
+            group_size = max(valid)
+        elif group_size not in valid:
+            raise ValueError(f"group_size={group_size} does not divide the scale groups of {span} inputs "
+                             f"(valid: {valid})")
+        return np.repeat(s, span // group_size, axis=1), group_size
+    s = s.reshape(-1)
     if s.size == 1:
-        return np.full(rows, s[0], dtype=np.float32)
-    if s.size != rows:
-        raise ValueError(f"weight_scale must be a scalar or have one value per row ({rows}), got {s.size} values")
-    return s
+        s = np.full(rows, s[0], dtype=np.float32)
+    elif s.size != rows:
+        raise ValueError(f"weight_scale must be a scalar, one value per row ({rows}) or one per group "
+                         f"[{rows}, groups], got shape {np.shape(weight_scale)}")
+    group_size = 64 if group_size is None else group_size
+    if group_size not in GROUP_SIZES:
+        raise ValueError(f"group_size must be one of {GROUP_SIZES}, got {group_size}")
+    if k % group_size:
+        valid = [g for g in GROUP_SIZES if k % g == 0]
+        raise ValueError(f"in_features={k} is not a multiple of group_size={group_size} (valid: {valid})")
+    return np.repeat(s[:, None], k // group_size, axis=1), group_size
 
 
 def pack_ternary_mlx(
-    codes: Any, weight_scale: Any, group_size: int = 64, dtype: Any = "float32"
+    codes: Any, weight_scale: Any, group_size: int | None = None, dtype: Any = "float32"
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Pack ternary ``codes`` [N, K] into MLX 2-bit affine arrays ``(w_q, scales, biases)``.
 
-    ``weight_scale`` is the repo's multiplier (a scalar, or one value per row), so ``W = codes * weight_scale``.
-    The result represents W exactly (``scales`` and ``biases`` are rounded to ``dtype``) for
+    ``weight_scale`` is the multiplier, so ``W = codes * weight_scale``: a scalar, one value per row, or one
+    per group of inputs ([N, G], as in ``PackedTernaryLinear`` and Bonsai). The result represents W exactly
+    (``scales`` and ``biases`` are rounded to ``dtype``) for
     ``mx.quantized_matmul(x, w_q, scales, biases, transpose=True, group_size=group_size, bits=2)``:
     ``w_q`` is uint32 [N, K / 16] holding ``code + 1`` in 2 bits each, least significant bits first along K;
-    ``scales`` is ``weight_scale`` and ``biases`` is ``-weight_scale``, both [N, K / group_size].
+    ``scales`` is ``weight_scale`` and ``biases`` is ``-weight_scale``, both [N, K / group_size]. ``group_size``
+    defaults to 64 for scalar and per-row scales and to the largest MLX group size that fits inside one scale
+    group for per-group scales (128 for Bonsai).
     """
     mx, _ = _mlx()
     import numpy as np
@@ -137,16 +227,11 @@ def pack_ternary_mlx(
     if c.ndim != 2:
         raise ValueError(f"codes must have shape [out_features, in_features], got {c.shape}")
     rows, k = c.shape
-    if group_size not in GROUP_SIZES:
-        raise ValueError(f"group_size must be one of {GROUP_SIZES}, got {group_size}")
-    if k % group_size:
-        valid = [g for g in GROUP_SIZES if k % g == 0]
-        raise ValueError(f"in_features={k} is not a multiple of group_size={group_size} (valid: {valid})")
+    scales, group_size = _scale_matrix(weight_scale, rows, k, group_size)
     if not np.isin(c, (-1, 0, 1)).all():  # also rejects NaN and non-integer floats
         raise ValueError("codes must hold only -1, 0 and 1")
     q = (c.astype(np.int64) + 1).astype(np.uint32).reshape(rows, k // 16, 16)
     w_q = np.bitwise_or.reduce(q << np.arange(0, 32, 2, dtype=np.uint32), axis=-1)
-    scales = np.repeat(_row_scales(weight_scale, rows)[:, None], k // group_size, axis=1)
     dt = _mx_dtype(dtype)
     return mx.array(w_q), mx.array(scales).astype(dt), mx.array(-scales).astype(dt)
 
@@ -157,6 +242,28 @@ def from_packed_repo(
     """:func:`pack_ternary_mlx` starting from the repo's packed uint8 layout (``BitLinearInference.weight_packed``)."""
     codes = unpack_ternary(torch.as_tensor(_numpy(weight_packed)), out_features)
     return pack_ternary_mlx(codes, weight_scale, group_size=group_size, dtype=dtype)
+
+
+def from_packed_ternary_linear(layer: nn.Module, dtype: Any = None) -> tuple[mx.array, mx.array, mx.array, int]:
+    """MLX arrays ``(w_q, scales, biases, group_size)`` of a weight-only ``PackedTernaryLinear``.
+
+    Exact: ``mx.quantized_matmul(x, w_q, scales, biases, transpose=True, group_size=group_size, bits=2)``
+    equals ``x @ (codes * scale).T``. ``dtype`` defaults to the layer's scale dtype (bfloat16 for Bonsai).
+    Bias and LoRA adapters are not included.
+    """
+    from ..weight_only import PackedTernaryLinear
+
+    if not isinstance(layer, PackedTernaryLinear):
+        raise TypeError(f"expected a PackedTernaryLinear, got {type(layer).__name__}")
+    if dtype is None:
+        dtype = str(layer.weight_scale.dtype).removeprefix("torch.")
+    span = layer.in_features // layer.weight_scale.shape[1]  # inputs per scale
+    fits = [g for g in GROUP_SIZES if span % g == 0]
+    if not fits:
+        raise ValueError(f"scale groups of {span} inputs fit none of MLX's group sizes {GROUP_SIZES}")
+    scale = layer.weight_scale.detach().float().cpu()
+    w_q, scales, biases = pack_ternary_mlx(layer.codes().cpu(), scale, group_size=max(fits), dtype=dtype)
+    return w_q, scales, biases, max(fits)
 
 
 def compiled(fn: Callable, **kwargs: Any) -> Callable:

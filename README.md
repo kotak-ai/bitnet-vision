@@ -31,6 +31,7 @@ export to packed 2-bit weights that make checkpoints 8 to 14 times smaller.
 | Training | CIFAR-10 loader, BitNet's two-stage schedule and other schedules, distillation, "full precision first, then ternary" switching, BitNet v2's late switch to 4-bit activations, bf16 autocast, safe resumable checkpoints. |
 | Export | `convert_for_inference` stores 4 weights per byte and runs int8 activations through an integer matmul. |
 | LoRA | Small full-precision adapters on any ternary layer or `nn.Linear`, trained with the base model frozen, saved and loaded in PEFT's file format, kept through export. |
+| Ternary FLUX.2 | PrismML's ternary FLUX.2 klein (Bonsai Image 4B) kept at 2 bits per weight, with existing FLUX.2 klein LoRAs on top, and a script that measures and re-trains how well they transfer (experimental). |
 
 Why each design choice was made, with the papers behind it: [docs/RESEARCH.md](docs/RESEARCH.md).
 What was wrong with the earlier attempts in this repo: [docs/AUDIT.md](docs/AUDIT.md).
@@ -39,7 +40,7 @@ What was wrong with the earlier attempts in this repo: [docs/AUDIT.md](docs/AUDI
 
 ```bash
 pip install torch          # any version from 2.2, CPU or CUDA
-pip install -e ".[dev]"    # add ,lora for safetensors adapter files: ".[dev,lora]"
+pip install -e ".[dev]"    # add ,lora for safetensors adapter files: ".[dev,lora]"; ,flux for FLUX.2
 pytest -q                  # about a minute on a laptop CPU; add -m "not slow" to skip training checks
 ```
 
@@ -226,7 +227,7 @@ Things worth knowing:
 * **Existing LoRAs.** `load_lora` reads PEFT's files and plain state dicts, and checks every shape before
   it changes anything. Adapters whose module names and shapes match this model's (`blocks.3.attn.qkv`,
   `head`, ...: timm's ViT names) load directly; adapters made for other models need their keys renamed
-  first.
+  first. FLUX.2 klein LoRAs for image generation have their own loader (next section).
 * **Merging.** `merge_lora_into_weights` folds an adapter into the weights only where that is exact: plain
   `nn.Linear` layers, and ternary layers built without the inner norm (`input_norm=False`). BitViT's
   ternary layers normalize their input inside the layer while the adapter does not, so no change of their
@@ -236,6 +237,215 @@ Things worth knowing:
   load them back. Older checkpoints load as before.
 * **`torch.compile`:** add or load adapters before compiling. PyTorch 2.4 and newer notice later changes
   of strength or on/off; PyTorch 2.2 does not (call `torch._dynamo.reset()` after such changes).
+
+## Existing image LoRAs (ternary FLUX.2 klein)
+
+Experimental. The only ternary text-to-image model released at scale is PrismML's Bonsai Image 4B: FLUX.2
+[klein] 4B with the 100 matmul layers of its 25 transformer blocks ternary (-s, 0 or +s, one scale s per 128
+weights along the input axis). Unlike BitNet it is weight-only: activations stay 16-bit and there is no norm
+inside the layers. Embedders, modulation layers, `norm_out` and `proj_out` stay 16-bit. Bonsai keeps klein's
+layer names and shapes, so the LoRAs people trained for FLUX.2 klein 4B (about 180 on Hugging Face and 420 on
+Civitai on 2026-10-12; klein-base 4B LoRAs fit too) attach to it unchanged. `bitnet_vision.generators` loads
+Bonsai with those 100 layers kept at 2 bits in memory and runs such LoRAs on top as full-precision side
+branches. `scripts/flux2_lora.py` makes images, measures how much of a LoRA's effect survives on the ternary
+base, and can re-train a LoRA to fit that base better.
+
+### What works
+
+* **Loading Bonsai.** `load_bonsai_transformer()` reads either Bonsai repo (by default the MLX pack, a 1.43 GB
+  download; or the 7.75 GB bfloat16 one) or a local copy, and returns diffusers' `Flux2Transformer2DModel`
+  whose 100 ternary layers are `PackedTernaryLinear`. It builds the model without weights and reads one
+  tensor at a time, so the dense weights never exist: the packed transformer holds 1.37 GB (0.92 GB of 2-bit
+  codes, 0.06 GB of scales, 0.39 GB of 16-bit layers) against 7.75 GB dense. It checks that the weights
+  really are ternary and refuses them otherwise. Checked on the real files: both layouts load to identical
+  tensors, and the packed transformer's output equals diffusers' dense bfloat16 model bit for bit.
+* **The layer.** `PackedTernaryLinear` stores 4 codes per byte plus one scale per group. Each call rebuilds
+  the dense weight in the input's dtype (exact, since every weight is a code times a scale) and calls
+  `F.linear`, then drops it. `cache_dense=True` keeps it (dense speed, dense memory).
+* **LoRA files.** `load_flux2_lora` takes a file, a folder, a Hugging Face repo id or a state dict, in every
+  FLUX.2 format diffusers 0.41 reads: PEFT, diffusers, ai-toolkit, BFL names and kohya. The keys go through
+  diffusers' own `Flux2KleinPipeline.lora_state_dict`, so names, the split of fused qkv LoRAs into q, k and
+  v, and the scale (kohya's alpha / rank, the `lora_adapter_metadata` header with rsLoRA and rank or alpha
+  patterns, otherwise 1) are what `pipe.load_lora_weights` uses. Fused single-block layers
+  (`to_qkv_mlp_proj`) stay one layer with one LoRA, as in diffusers. Every module of fal's spritesheet LoRA
+  computes exactly what diffusers' LoRA layer computes (checked on the real file). Several LoRAs load side by
+  side under different names, each with its own strength (`set_lora_strength`).
+* **Nothing is dropped silently.** Text-encoder parts are skipped with a warning and listed in the returned
+  summary. Everything else that cannot be attached (DoRA, LoHa, LoKr and other LyCORIS types, LoRA biases,
+  modules diffusers' converter does not map, wrong shapes) is refused with the reason before the model
+  changes. diffusers itself drops DoRA's `dora_scale` and unmapped kohya modules with only a log message.
+* **Why side branches.** Merging a LoRA into ternary weights means rounding again, and a LoRA's change is far
+  smaller than half a rounding step: on five slices of Bonsai, re-rounding with the spritesheet LoRA merged
+  in changed 0 codes. `merge_lora_into_weights` refuses packed layers.
+* **Tested here** on a tiny FLUX.2 transformer: both Bonsai file layouts, every LoRA format against diffusers'
+  own loading (float32, exact up to summation order), and the script's sampler against `Flux2KleinPipeline`
+  bit for bit. Three more tests run only on an Apple GPU (unpacking there, loading straight onto `mps`, LoRA
+  on the GPU model).
+
+```python
+import torch
+from diffusers import Flux2KleinPipeline
+from bitnet_vision.generators import BONSAI_UNPACKED, load_bonsai_transformer, load_flux2_lora
+
+transformer = load_bonsai_transformer()   # prism-ml/bonsai-image-ternary-4B-mlx-2bit
+print(load_flux2_lora(transformer, "Sawata97/flux2_4b_koni_animestyle", name="anime", strength=1.0))
+# text encoder, tokenizer, VAE and scheduler; the 7.75 GB transformer folder of that repo is not downloaded
+pipe = Flux2KleinPipeline.from_pretrained(BONSAI_UNPACKED, transformer=transformer, torch_dtype=torch.bfloat16)
+pipe.to("mps")
+image = pipe("anime_style, a red fox in a snowy forest", num_inference_steps=4, guidance_scale=1.0,
+             generator=torch.Generator("cpu").manual_seed(0)).images[0]
+```
+
+### On the Mac
+
+macOS 14 or newer (bfloat16 on the GPU) and PyTorch 2.14 or newer:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U "torch>=2.14" && pip install -e ".[flux,dev]"
+pytest tests/test_weight_only.py tests/test_flux2.py tests/test_flux2_scripts.py   # includes the GPU-only checks
+python scripts/flux2_lora.py generate --tiny     # the whole path on a tiny random model: seconds, no download
+
+LORA=Sawata97/flux2_4b_koni_animestyle           # a text-to-image style LoRA for klein 4B, trigger anime_style
+python scripts/flux2_lora.py generate --lora $LORA --prompt "anime_style, a red fox in a snowy forest" --seed 0 1
+python scripts/flux2_lora.py compare --lora $LORA --prompt "anime_style, a red fox in a snowy forest" \
+    --prompt "anime_style, a lighthouse on a rocky coast" --seed 0 1
+python scripts/flux2_lora.py realign --lora $LORA --out flux2_results/realigned-anime
+python scripts/flux2_lora.py realign --lora $LORA --match effect --out flux2_results/realigned-anime-effect
+python scripts/flux2_lora.py compare --lora $LORA --realigned flux2_results/realigned-anime \
+    --prompt "anime_style, a hot air balloon over green hills" --seed 0
+```
+
+Results go to `flux2_results/` (images, a labeled `grid.png`, and a JSON file with every setting, the
+metrics, timings and memory readings). If PyTorch reports an operation missing on MPS, rerun with
+`PYTORCH_ENABLE_MPS_FALLBACK=1`. Downloads, about 17.6 GB in all: the Bonsai pack (1.43 GB), the text
+encoder, tokenizer and VAE (8.2 GB), klein 4B's transformer (7.75 GB, only for `compare` and `realign`) and
+the LoRA. Only one transformer is in memory at a time, and the text encoder (8 GB, the largest part) is freed
+once the prompts are encoded, so 96 GB is far more than any command needs.
+
+The three commands (`--device` and `--dtype` pick other devices and dtypes; `--tiny` runs any of them on a
+tiny random pipeline built on the spot, which is what the tests do):
+
+* **generate**: Bonsai, packed, with any number of `--lora SOURCE[:STRENGTH]`. `SOURCE` is a file, a folder,
+  a repo id, or `owner/repo/file.safetensors` for a repo holding several files. 4 steps and guidance 1.0 as
+  the model cards say; 1024 x 1024 on a GPU, 512 x 512 on the CPU. The loop repeats `Flux2KleinPipeline`'s
+  own, so for the same noise the image is exactly the pipeline's. The text encoder and VAE come from Bonsai's
+  unpacked repo; they are byte-identical to klein 4B's (same SHA-256), so one encoding serves both bases.
+* **compare**: the same prompts, seeds and noise through (a) klein 4B, (b) klein 4B + LoRA, (c) Bonsai,
+  (d) Bonsai + LoRA, and with `--realigned` (e) Bonsai + the re-aligned LoRA. With D = (with LoRA) minus
+  (without), on the same base: `first_step_cos` and `first_step_norm` compare D of the transformer's output
+  at the first step, where both bases get identical inputs (the noise), so they isolate the LoRA's effect
+  (cosine of D on Bonsai with D on klein, and the ratio of their sizes). `retention_cos` and `retention_norm`
+  do the same for the final latents, which also carry the drift between the two bases' trajectories, so they
+  read lower even when the images look alike. `psnr_d_vs_b` compares image (d) with (b); `psnr_c_vs_a` gives
+  the gap between the bases without any LoRA, for scale.
+* **realign**: data-free distillation, as EfficientDM (arXiv 2310.03270) does for quantized diffusion models.
+  Teacher: klein 4B + the LoRA, frozen. Student: packed Bonsai + the same LoRA, of which only A and B train.
+  The teacher samples 32 trajectories (16 built-in prompts with the LoRA's trigger words, 2 seeds each, 512
+  x 512) and the student learns its outputs at exactly the same inputs. `--match output` (default,
+  EfficientDM's loss) matches the outputs, so the LoRA also learns to pull Bonsai toward klein: judge it by
+  `psnr_e_vs_b`. `--match effect` matches the LoRA's effect (with minus without), so the LoRA stays a pure
+  add-on (strength 0 is plain Bonsai) and the retention numbers are what should rise. AdamW, lr 1e-4, 300
+  steps, gradient checkpointing, the model's own dtype. 4 held-out prompts with new seeds are scored every
+  100 steps. It saves `pytorch_lora_weights.safetensors` in diffusers' format (rank and alpha in its
+  metadata; `pipe.load_lora_weights` and `load_flux2_lora` both read it, with the same result) and the same
+  adapter in this repo's PEFT format under `peft/`.
+
+Three text-to-image LoRAs load as they are (checked on the files): `Sawata97/flux2_4b_koni_animestyle`
+(ai-toolkit format, 100 modules, rank 64, trigger `anime_style`), `Limbicnation/pixel-art-lora` (diffusers
+format with rsLoRA metadata, 86 modules, rank 64) and `adirik/pixel-art-lora-flux.2-klein-4B` (trained on
+klein-base 4B, 100 modules, rank 128, trigger `PXART4`). fal's spritesheet LoRA is an image-editing LoRA, so
+the text-to-image commands show little of it; its repo holds two different LoRAs, so name the file:
+`--lora fal/flux-2-klein-4b-spritesheet-lora/flux-spritesheet-lora.safetensors`.
+
+### What a real run measured
+
+Nothing has run on a Mac yet. One real run on a 4-thread Linux CPU, with standalone scripts that call
+`load_bonsai_transformer`, `load_flux2_lora` and diffusers 0.41's `Flux2KleinPipeline` (before
+`scripts/flux2_lora.py` existed). Setup: bfloat16 models, 4 steps, guidance 1.0, the prompt padded to 512
+text tokens. Bonsai packed from the MLX pack; klein 4B dense. The LoRA, the only one tested, was
+`fal/flux-2-klein-4b-spritesheet-lora` (`flux-spritesheet-lora.safetensors`, rank 16) at strength 1.0, in
+float32 on both bases. Prompts: "2x2 sprite sheet of a yellow sports car", "2x2 sprite sheet of a green army
+tank" and "a photo of a cat sitting on a wooden table, soft window light"; seeds 11 and 12; 512 x 512; the
+same noise for both bases.
+
+* **Images.** With the LoRA, both bases drew the LoRA's 2 x 2 sheet in all 4 sprite runs (two isometric views
+  on top, a side view and a top-down view below, flat cartoon style, white background). Without it, klein
+  drew 4 identical side views and Bonsai 4 to 6 front or side views: the bases differ a lot on their own (the
+  final latents by 104% in relative norm, on average). On the cat prompt the LoRA made a small change of the
+  same kind on both bases (cat more centered and frontal, warmer), with no sprite sheet leaking in.
+* **How much of the LoRA's effect survives** (means over the 6 prompt and seed pairs):
+
+  | D = with LoRA minus without, on the same base | cos(D on Bonsai, D on klein) | size ratio |
+  |---|---|---|
+  | Transformer output at the first step (identical inputs) | 0.45 (0.26 to 0.66) | 0.59 |
+  | Transformer output at klein + LoRA's own states (24 held-out states, 256 x 256) | 0.45 | 0.68 |
+  | Final latents | 0.28 (0.06 to 0.51) | 0.94 |
+  | Decoded pixels | 0.33 | 1.02 |
+  | Pixels averaged down to 16 x 16 | 0.51 (sprite prompts only: 0.58) | |
+
+  For comparison, the same LoRA through diffusers' own loader (bfloat16 adapter) against this one (float32),
+  both on klein, gives a final-latent cosine of 0.989 to 0.999: the low values above are real, not rounding.
+  So the LoRA keeps its direction only partly (cosine about 0.45 at identical inputs) and about 60 to 70% of
+  its size. Yet in all 4 sprite runs it moved Bonsai's image toward klein + LoRA's: at 16 x 16, Bonsai + LoRA
+  was closer to klein + LoRA (relative distance 0.10, 0.17, 0.10, 0.15) than Bonsai was to klein without it
+  (0.27, 0.35, 0.14, 0.20). The cat runs did not move closer.
+* **Strength above 1** makes the effect larger, not better aimed: at strength 1, 1.5 and 2 the first-step size
+  ratio was 0.59, 0.74 and 0.85 and the cosine 0.45, 0.43 and 0.37. At 1.5 and 2 the background of all 4
+  Bonsai sprite sheets turned red, the color of the LoRA's own editing example (klein at 1.0 stays white in
+  text-to-image; klein at 1.5 was not run).
+* **Image editing** (the LoRA's own use, its card's jet fighter as input, one sample): klein + LoRA gave a sheet
+  close to fal's example; Bonsai + LoRA gave a 2 x 2 sheet of four views on a salmon background with a less
+  faithful jet (final-latent cosine 0.28, decoded pixels 0.80, at 16 x 16 0.91).
+* **Re-alignment did not help at a small budget.** Matching the LoRA's effect (as `--match effect` does) on 64
+  teacher states (8 other prompts, 2 other seeds, 4 steps, 256 x 256), 48 Adam steps at lr 1e-4, one state per
+  step: on held-out prompts and seeds the cosine went from 0.45 to 0.42 and the size ratio from 0.68 to 0.57
+  (on the training states the cosine rose from 0.40 to 0.51), and in full generation at 512 the final-latent
+  cosine went from 0.28 to 0.26. Whether a much longer run helps (EfficientDM trains 16,000 iterations) is
+  untested.
+* **Time per sampling step** at 512 x 512 on that CPU: packed Bonsai 10.6 to 12.7 s without a LoRA and 14.5 to
+  16.3 s with it; dense klein 6.7 to 8.9 s, 11.0 to 12.1 s with this LoRA branch and about 9.2 to 10.2 s with
+  diffusers' bfloat16 LoRA. **Memory:** loading the MLX pack took 19 s and 1.51 GB (3.22 GB resident with the
+  memory-mapped file); Bonsai generating at 512 with the LoRA used 2.70 GB (3.31 GB resident), re-alignment
+  3.49 GB; dense klein 9.31 GB resident (mostly its memory-mapped 7.75 GB file); the text encoder 8.99 GB
+  resident.
+
+The sample is small: one LoRA, 3 prompts, 2 seeds, no CLIP or FID score.
+
+![The spritesheet LoRA on klein 4B and on ternary Bonsai](docs/images/flux2_lora_sprite_car.jpg)
+
+*"2x2 sprite sheet of a yellow sports car", seed 11, 512 x 512, from the run above. Top: klein 4B, klein 4B
+with the LoRA (this repo's loader, then diffusers' own). Middle: ternary Bonsai, then with the LoRA at
+strength 1.0, 1.5 and 2.0. Bottom: Bonsai with the briefly re-aligned LoRA.*
+
+### Limits
+
+* **Ternary saves memory, not time, on an M2 Max.** Its GPU has no faster low-bit arithmetic, and the packed
+  layers rebuild their dense weights on every call: on the CPU above a packed step was 40 to 60% slower than
+  dense klein. Mac timings are not measured yet. `cache_dense=True` (`--cache-dense`) gives the speed back
+  along with the memory.
+* **How well a LoRA transfers varies,** and the one measured kept only about half its effect. Bonsai's
+  weights differ from klein 4B's by 54 to 57% in relative norm, while a LoRA's own change is 2 to 3%. Run
+  `compare` on your LoRA before relying on it; LoRAs for klein 9B or FLUX.2 dev do not fit at all.
+* **Only plain LoRA.** DoRA, LoKr, LoHa and the other LyCORIS types are refused, as are ai-toolkit files with
+  `lora_down` / `lora_up` keys under `diffusion_model.` (diffusers cannot load those either).
+* **Text-encoder parts of a LoRA are skipped** (with a warning): only the transformer takes adapters.
+* **Adapters are float32** by default, so float32 files load unrounded; diffusers stores them in the model's
+  dtype. That rounding matters: in diffusers alone, switching the adapter from float32 to bfloat16 moves the
+  model's output by 10.6% of the LoRA's effect. `adapter_dtype=None` gives diffusers' behavior. diffusers'
+  `joint_attention_kwargs={"scale": ...}` does not reach these adapters: use `set_lora_strength`.
+* **Packed layers have no `.weight`.** The normal forward pass does not need it, but code that reads it (qkv
+  fusion, some offloading hooks) fails on those 100 layers.
+* **The script makes images from text only.** Editing LoRAs need an input image: use the pipeline directly
+  with `image=`.
+
+### Licenses
+
+Bonsai Image 4B is Apache-2.0 (PrismML; its notice names FLUX.2 [klein] 4B and Qwen3-4B as sources). FLUX.2
+[klein] 4B (Black Forest Labs) and the Qwen3-4B text encoder are Apache-2.0 too; other FLUX.2 models have their
+own terms. Every LoRA has its own license: the four named here declare Apache-2.0 on their model cards
+(checked 2026-10-12), but check each one before you use or share its results, and note that many LoRAs on
+Hugging Face and Civitai depict real people or adult content.
 
 ## Memory and speed, honestly
 
@@ -303,10 +513,16 @@ checkpoints load with `torch.load(..., weights_only=True)`.
 
 ## Tests
 
-`pytest` runs about 430 tests (150 more run only on a Mac), including exact comparisons with Microsoft's
+`pytest` runs about 450 tests (150 more run only on a Mac), including exact comparisons with Microsoft's
 reference code (forward and backward), float16/bfloat16 behavior, Hadamard exactness at every ViT width,
 export equivalence, resume exactness, LoRA adapters against their formula and through export and
-checkpoints (and against the PEFT library when it is installed), and short end-to-end training runs.
+checkpoints (and against the PEFT library when it is installed), and short end-to-end training runs. With the
+`flux` extra, 26 more check the FLUX.2 code on a tiny `Flux2Transformer2DModel`: both Bonsai file layouts, and
+every LoRA format against diffusers' own loading on the dense model, in float32, plus every refusal (no network
+needed). 11 more run `scripts/flux2_lora.py` with `--tiny`: its sampler against `Flux2KleinPipeline` bit for
+bit (float32, bfloat16, and with guidance), all three commands, retention exactly 1 when both bases hold the
+same weights, a lower loss after `realign`, and the re-aligned LoRA loading in diffusers and in
+`load_flux2_lora` with the same result. 3 of the FLUX.2 and weight-only tests run only on an Apple GPU.
 `python tools/mutation_test.py` plants 62 known bugs one at a time (including every bug found in the old
 branches) and checks that the tests catch each one.
 
@@ -319,11 +535,14 @@ bitnet_vision/
   hadamard.py     exact Hadamard rotations for 2^k, 12*2^k, 20*2^k, ... widths
   export.py       2-bit packing and the inference layer
   lora.py         LoRA adapters: the side branch, training helpers, PEFT-format files
+  weight_only.py  weight-only packed ternary layer with per-group scales (imported models such as Bonsai)
+  generators/     FLUX.2 klein / Bonsai Image 4B loading and existing FLUX.2 LoRAs (needs the flux extra)
   checkpoint.py   save/load for training and packed checkpoints
   models/vit.py   BitViT and presets
   training/       data, schedules, optimizer groups, distillation, training loop
   apple/          experimental Metal kernels (PyTorch MPS) and MLX port of the inference layer
-scripts/          train.py, eval.py, bench.py, cifar_experiments.sh, apple_check.py, apple_bench.py
+scripts/          train.py, eval.py, bench.py, cifar_experiments.sh, apple_check.py, apple_bench.py,
+                  flux2_lora.py (FLUX.2 / Bonsai with LoRAs: generate, compare, realign)
 tools/            mutation_test.py
 tests/            unit and regression tests; reference.py holds Microsoft's reference code
 docs/             RESEARCH.md (papers and design choices), AUDIT.md (problems in the old branches)

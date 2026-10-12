@@ -15,3 +15,4 @@ runs/
 *.pt
 *.pth
 apple_results/
+flux2_results/

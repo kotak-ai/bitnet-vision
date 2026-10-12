@@ -18,6 +18,7 @@ from .lora import (
 )
 from .models import MODEL_PRESETS, BitViT, BitViTConfig, create_model
 from .quant import fake_quant_activations, fake_quant_weights, quantize_activations, quantize_weights, ste
+from .weight_only import PackedTernaryLinear
 
 __version__ = "0.1.0"
 
@@ -43,6 +44,7 @@ __all__ = [
     "convert_for_inference",
     "pack_ternary",
     "unpack_ternary",
+    "PackedTernaryLinear",
     "LoRASettings",
     "add_lora",
     "delete_lora",

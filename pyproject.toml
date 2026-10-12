@@ -14,6 +14,8 @@ dependencies = ["torch>=2.2"]
 dev = ["pytest>=7", "ruff>=0.17,<0.18", "numpy"]
 mlx = ["mlx>=0.32", "numpy"]  # bitnet_vision.apple.mlx_ternary, which converts arrays through NumPy
 lora = ["safetensors>=0.4"]  # LoRA adapter files as adapter_model.safetensors (adapter_model.bin without it)
+# bitnet_vision.generators: ternary FLUX.2 klein (Bonsai Image 4B) and existing FLUX.2 LoRAs
+flux = ["diffusers>=0.41", "transformers>=4.51", "accelerate", "safetensors>=0.4", "peft", "huggingface_hub"]
 
 [project.urls]
 Repository = "https://github.com/kotak-ai/bitnet-vision"

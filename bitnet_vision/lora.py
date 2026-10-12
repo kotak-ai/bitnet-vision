@@ -7,15 +7,16 @@ PEFT's (Kaiming uniform) and ``B`` at zero, so a new adapter changes nothing unt
 The branch reads the layer's raw input ``x``, before BitLinear's inner RMSNorm and Hadamard rotation, and is
 added to the final output after the bias. It runs in float32 (float64 for float64 inputs, also under autocast)
 and is never quantized. A LoRA trained on an ordinary ``nn.Linear`` expects exactly this, and the branch stays
-exact through export: the packed 2-bit layers, the fused Apple layers and the MLX port run the same branch.
+exact through export: the packed 2-bit layers, the fused Apple layers and the MLX port run the same branch,
+and so does the weight-only layer for imported ternary models (``bitnet_vision.weight_only``).
 
 Layout, PEFT's, so files map one to one: a layer with adapters holds ModuleDicts ``lora_A`` and ``lora_B``
 keyed by adapter name (state-dict keys ``<module>.lora_A.<adapter>.weight``; the base layer's keys do not
 change) and ``lora_settings``, a dict of :class:`LoRASettings` in the same order. BitLinear, HBitLinear,
-BitLinearInference and FusedBitLinearInference call :func:`lora_forward` at the end of their forward and
-declare ``lora_settings = None`` at class level, which is how another layer class (with ``in_features``,
-``out_features`` and a ``weight`` or ``weight_scale`` tensor) opts in. A plain ``nn.Linear`` gets a forward
-hook that calls :func:`lora_forward`.
+BitLinearInference, FusedBitLinearInference and PackedTernaryLinear call :func:`lora_forward` at the end of
+their forward and declare ``lora_settings = None`` at class level, which is how another layer class (with
+``in_features``, ``out_features`` and a ``weight`` or ``weight_scale`` tensor) opts in. A plain ``nn.Linear``
+gets a forward hook that calls :func:`lora_forward`.
 
 Files: :func:`save_lora` writes PEFT's format (``adapter_config.json`` and ``adapter_model.safetensors``, or
 ``adapter_model.bin`` without the safetensors package), with keys ``base_model.model.<module>.lora_A.weight``.
@@ -187,15 +188,18 @@ def add_lora_adapter(
     alpha: float = 16.0,
     dropout: float = 0.0,
     use_rslora: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> LoRASettings:
-    """Add one adapter to one layer and return its settings. ``A`` and ``B`` get the layer's device and dtype."""
+    """Add one adapter to one layer and return its settings. ``A`` and ``B`` get the layer's device, and its
+    dtype unless ``dtype`` is given (float32 adapters on a bfloat16 model avoid rounding imported weights)."""
     if not supports_lora(layer):
         raise TypeError(f"LoRA adapters need a BitLinear-family layer or a plain nn.Linear, got {type(layer).__name__}")
     _check_name(name)
     if name in _settings(layer):
         raise ValueError(f"the layer already has an adapter named {name!r}")
     settings = LoRASettings(r=r, alpha=float(alpha), dropout=float(dropout), use_rslora=bool(use_rslora))
-    device, dtype = _device_dtype(layer)
+    device, layer_dtype = _device_dtype(layer)
+    dtype = layer_dtype if dtype is None else dtype
     a = nn.Linear(layer.in_features, r, bias=False, device=device, dtype=dtype)
     b = nn.Linear(r, layer.out_features, bias=False, device=device, dtype=dtype)
     with torch.no_grad():
@@ -252,12 +256,14 @@ def add_lora(
     name: str = "default",
     dropout: float = 0.0,
     use_rslora: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> list[str]:
     """Add adapter ``name`` to every supported layer whose qualified name matches ``targets``.
 
     ``targets``: module-name suffixes (``"qkv"`` matches ``blocks.3.attn.qkv``), a string taken as a regular
     expression that must match the whole name (as in PEFT), or None for every supported layer. Matching
-    modules of other types (``patch_embed.proj`` is a Conv2d) are skipped. Returns the targeted names.
+    modules of other types (``patch_embed.proj`` is a Conv2d) are skipped. ``dtype`` is the adapters' dtype
+    (default: each layer's). Returns the targeted names.
     """
     _check_name(name)
     targets = list(targets) if targets is not None and not isinstance(targets, str) else targets
@@ -270,7 +276,7 @@ def add_lora(
         raise ValueError(f"adapter {name!r} already exists on {taken}")
     LoRASettings(r=r, alpha=float(alpha), dropout=float(dropout))  # validate before changing anything
     for _, m in chosen:
-        add_lora_adapter(m, name, r=r, alpha=alpha, dropout=dropout, use_rslora=use_rslora)
+        add_lora_adapter(m, name, r=r, alpha=alpha, dropout=dropout, use_rslora=use_rslora, dtype=dtype)
     return [n for n, _ in chosen]
 
 
@@ -505,9 +511,10 @@ def _parse_key(key: str) -> tuple[str, str, str | None] | None:
 
 
 def _pattern_value(patterns: Mapping[str, Any] | None, module: str, default: Any) -> Any:
-    """PEFT's rank_pattern / alpha_pattern lookup: the first key (a regex) matching the end of the name."""
+    """PEFT's rank_pattern / alpha_pattern lookup (peft.utils.other.get_pattern_key): the first key, a regex,
+    that matches the end of the name after a dot."""
     for key, value in (patterns or {}).items():
-        if re.fullmatch(rf"(.*\.)?{key}", module):
+        if re.fullmatch(rf"(.*\.)?({key})", module):
             return value
     return default
 
@@ -530,6 +537,7 @@ def load_lora(
     strength: float = 1.0,
     *,
     config: Mapping[str, Any] | None = None,
+    dtype: torch.dtype | None = None,
 ) -> list[str]:
     """Add the adapter stored at ``path_or_state_dict`` to ``model`` as adapter ``name``; returns its layers.
 
@@ -538,8 +546,8 @@ def load_lora(
     prefix and may or may not include an adapter name (``lora_A.weight`` or ``lora_A.<adapter>.weight``).
     ``config`` (PEFT's fields: ``r``, ``lora_alpha``, ``use_rslora``, ``lora_dropout``, ``rank_pattern``,
     ``alpha_pattern``, ``modules_to_save``) overrides the file's; without any, alpha equals the rank (scale 1).
-    Modules listed in ``modules_to_save`` are overwritten in place. Everything is checked before the model
-    changes.
+    Modules listed in ``modules_to_save`` are overwritten in place. ``dtype`` is the adapters' dtype (default:
+    each layer's). Everything is checked before the model changes.
     """
     _check_name(name)
     file_config = None
@@ -609,7 +617,7 @@ def load_lora(
 
     for _, layer, a, b, r, alpha in plan:
         s = add_lora_adapter(layer, name, r=r, alpha=alpha, dropout=float(config.get("lora_dropout") or 0.0),
-                             use_rslora=bool(config.get("use_rslora", False)))
+                             use_rslora=bool(config.get("use_rslora", False)), dtype=dtype)
         s.strength = float(strength)
         with torch.no_grad():
             layer.lora_A[name].weight.copy_(a)
